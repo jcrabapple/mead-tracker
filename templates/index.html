@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Mead Tracker — Dashboard{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h4 class="mb-0"><i class="bi bi-grid"></i> My Batches</h4>
+    <a href="/batch/new" class="btn btn-honey btn-sm">
+        <i class="bi bi-plus-circle"></i> New Batch
+    </a>
+</div>
+
+{% if batches %}
+<!-- Summary stats -->
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+        <div class="card stat-card">
+            <div class="stat-value">{{ batches|selectattr('status','equalto','active')|list|length }}</div>
+            <div class="stat-label">Active</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="card stat-card">
+            <div class="stat-value">{{ batches|selectattr('status','equalto','aging')|list|length }}</div>
+            <div class="stat-label">Aging</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="card stat-card">
+            <div class="stat-value">{{ batches|selectattr('status','equalto','bottled')|list|length + batches|selectattr('status','equalto','drinking')|list|length }}</div>
+            <div class="stat-label">Bottled/Drinking</div>
+        </div>
+    </div>
+    <div class="col-6 col-md-3">
+        <div class="card stat-card">
+            <div class="stat-value">{{ batches|length }}</div>
+            <div class="stat-label">Total</div>
+        </div>
+    </div>
+</div>
+
+<!-- Batch cards -->
+<div class="row g-3">
+    {% for b in batches %}
+    <div class="col-12 col-md-6 col-lg-4">
+        <a href="/batch/{{ b.id }}" class="text-decoration-none">
+            <div class="card h-100" style="cursor:pointer;">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-start mb-2">
+                        <h6 class="card-title mb-0" style="color:#e6edf3;">{{ b.name }}</h6>
+                        <span class="badge badge-{{ b.status }}">{{ b.status }}</span>
+                    </div>
+                    <div class="text-muted small mb-2">
+                        {% if b.style %}{{ b.style }} · {% endif %}
+                        {% if b.yeast_strain %}{{ b.yeast_strain }} · {% endif %}
+                        {{ b.batch_size_gal }}gal
+                    </div>
+                    <div class="d-flex gap-3 small">
+                        {% if b.og %}
+                        <div>
+                            <span class="text-muted">OG</span>
+                            <strong style="color:var(--honey);">{{ '%.3f'|format(b.og) }}</strong>
+                        </div>
+                        {% endif %}
+                        {% if b.latest_gravity %}
+                        <div>
+                            <span class="text-muted">Current</span>
+                            <strong>{{ '%.3f'|format(b.latest_gravity.gravity) }}</strong>
+                        </div>
+                        {% endif %}
+                        {% if b.current_abv is not none %}
+                        <div>
+                            <span class="text-muted">ABV</span>
+                            <strong style="color:var(--honey);">~{{ b.current_abv }}%</strong>
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% if b.pitch_date %}
+                    <div class="text-muted small mt-2">
+                        <i class="bi bi-calendar3"></i> Pitched {{ b.pitch_date }}
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </a>
+    </div>
+    {% endfor %}
+</div>
+
+{% else %}
+<div class="text-center py-5">
+    <i class="bi bi-droplet" style="font-size:3rem; color:var(--honey);"></i>
+    <h5 class="mt-3">No batches yet</h5>
+    <p class="text-muted">Start tracking your first mead batch!</p>
+    <a href="/batch/new" class="btn btn-honey">
+        <i class="bi bi-plus-circle"></i> Create First Batch
+    </a>
+</div>
+{% endif %}
+{% endblock %}

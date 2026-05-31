@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}{% if batch %}Edit{% else %}New{% endif %} Batch — Mead Tracker{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-12 col-lg-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="bi bi-{% if batch %}pencil{% else %}plus-circle{% endif %}"></i>
+                    {% if batch %}Edit: {{ batch.name }}{% else %}New Batch{% endif %}
+                </h5>
+            </div>
+            <div class="card-body">
+                <form method="post">
+                    <div class="row g-3">
+                        <!-- Name -->
+                        <div class="col-12">
+                            <label class="form-label">Batch Name *</label>
+                            <input type="text" name="name" class="form-control"
+                                   value="{{ batch.name if batch else '' }}" required
+                                   placeholder="Spiced Pomegranate Mead">
+                        </div>
+
+                        <!-- Style + Size -->
+                        <div class="col-md-6">
+                            <label class="form-label">Style</label>
+                            <select name="style" class="form-select">
+                                <option value="">— Select —</option>
+                                {% set styles = ['Traditional', 'Melomel', 'Metheglin', 'Cyser', 'Pyment', 'Braggot', 'Session Mead', 'Sack Mead', 'Bochet', 'Other'] %}
+                                {% for s in styles %}
+                                <option value="{{ s }}" {% if batch and batch.style == s %}selected{% endif %}>{{ s }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Batch Size (gal)</label>
+                            <input type="number" name="batch_size_gal" step="0.1" min="0.1" class="form-control"
+                                   value="{{ batch.batch_size_gal if batch else '1.0' }}">
+                        </div>
+
+                        <!-- Honey + Yeast -->
+                        <div class="col-md-6">
+                            <label class="form-label">Honey Type</label>
+                            <input type="text" name="honey_type" class="form-control"
+                                   value="{{ batch.honey_type if batch else '' }}"
+                                   placeholder="Wildflower, Orange Blossom, etc.">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Yeast Strain</label>
+                            <select name="yeast_strain" class="form-select">
+                                <option value="">— Select —</option>
+                                {% set yeasts = ['D47', 'QA23', 'EC-1118', 'K1-V1116', '71B', 'D254', 'M05', 'Lalvin ICV-D47', 'Lalvin 71B-1122', 'Red Star Premier Blanc', 'Other'] %}
+                                {% for y in yeasts %}
+                                <option value="{{ y }}" {% if batch and batch.yeast_strain == y %}selected{% endif %}>{{ y }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <div class="col-12"><hr class="section-divider"></div>
+
+                        <!-- Gravities -->
+                        <div class="col-md-3">
+                            <label class="form-label">Original Gravity</label>
+                            <input type="number" name="og" step="0.001" min="0.900" max="1.250" class="form-control"
+                                   value="{{ batch.og if batch and batch.og else '' }}" placeholder="1.110">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Final Gravity</label>
+                            <input type="number" name="fg" step="0.001" min="0.900" max="1.250" class="form-control"
+                                   value="{{ batch.fg if batch and batch.fg else '' }}" placeholder="1.015">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Target FG</label>
+                            <input type="number" name="target_fg" step="0.001" min="0.900" max="1.250" class="form-control"
+                                   value="{{ batch.target_fg if batch and batch.target_fg else '' }}" placeholder="1.015">
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Target ABV %</label>
+                            <input type="number" name="target_abv" step="0.1" min="0" max="25" class="form-control"
+                                   value="{{ batch.target_abv if batch and batch.target_abv else '' }}" placeholder="14.0">
+                        </div>
+
+                        <div class="col-12"><hr class="section-divider"></div>
+
+                        <!-- Status + Dates -->
+                        <div class="col-md-4">
+                            <label class="form-label">Status</label>
+                            <select name="status" class="form-select">
+                                {% set statuses = [('planning','Planning'),('active','Active'),('aging','Aging'),('bottled','Bottled'),('drinking','Drinking'),('archived','Archived')] %}
+                                {% for val, label in statuses %}
+                                <option value="{{ val }}" {% if batch and batch.status == val %}selected{% endif %}>{{ label }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Pitch Date</label>
+                            <input type="date" name="pitch_date" class="form-control"
+                                   value="{{ batch.pitch_date if batch and batch.pitch_date else '' }}">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Bottled Date</label>
+                            <input type="date" name="bottled_date" class="form-control"
+                                   value="{{ batch.bottled_date if batch and batch.bottled_date else '' }}">
+                        </div>
+
+                        <div class="col-12"><hr class="section-divider"></div>
+
+                        <!-- Notes -->
+                        <div class="col-12">
+                            <label class="form-label">Recipe Source</label>
+                            <input type="text" name="recipe_source" class="form-control"
+                                   value="{{ batch.recipe_source if batch else '' }}"
+                                   placeholder="Obsidian vault path, URL, or book reference">
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Notes</label>
+                            <textarea name="notes" class="form-control" rows="4"
+                                      placeholder="Tasting goals, special process notes, etc.">{{ batch.notes if batch else '' }}</textarea>
+                        </div>
+
+                        <!-- Submit -->
+                        <div class="col-12 d-flex gap-2">
+                            <button type="submit" class="btn btn-honey">
+                                <i class="bi bi-check-circle"></i>
+                                {% if batch %}Save Changes{% else %}Create Batch{% endif %}
+                            </button>
+                            <a href="{% if batch %}/batch/{{ batch.id }}{% else %}/{% endif %}" class="btn btn-outline-secondary">
+                                Cancel
+                            </a>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

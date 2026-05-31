@@ -1,0 +1,432 @@
+{% extends "base.html" %}
+{% block title %}{{ batch.name }} — Mead Tracker{% endblock %}
+
+{% block content %}
+<!-- Header -->
+<div class="d-flex justify-content-between align-items-start mb-3">
+    <div>
+        <div class="d-flex align-items-center gap-2 mb-1">
+            <h4 class="mb-0">{{ batch.name }}</h4>
+            <span class="badge badge-{{ batch.status }}">{{ batch.status }}</span>
+        </div>
+        <div class="text-muted">
+            {% if batch.style %}{{ batch.style }} · {% endif %}
+            {% if batch.honey_type %}{{ batch.honey_type }} honey · {% endif %}
+            {% if batch.yeast_strain %}{{ batch.yeast_strain }} · {% endif %}
+            {{ batch.batch_size_gal }} gal
+        </div>
+    </div>
+    <div class="d-flex gap-2">
+        <a href="/batch/{{ batch.id }}/edit" class="btn btn-outline-secondary btn-sm">
+            <i class="bi bi-pencil"></i> Edit
+        </a>
+        <form method="post" action="/batch/{{ batch.id }}/delete" onsubmit="return confirm('Delete this batch and all its data?')">
+            <button type="submit" class="btn btn-outline-danger btn-sm">
+                <i class="bi bi-trash"></i>
+            </button>
+        </form>
+    </div>
+</div>
+
+<!-- Stats row -->
+<div class="row g-2 mb-4">
+    <div class="col-4 col-md-2">
+        <div class="card stat-card">
+            <div class="stat-value">{{ '%.3f'|format(batch.og) if batch.og else '—' }}</div>
+            <div class="stat-label">OG</div>
+        </div>
+    </div>
+    <div class="col-4 col-md-2">
+        <div class="card stat-card">
+            <div class="stat-value">{{ '%.3f'|format(batch.fg) if batch.fg else '—' }}</div>
+            <div class="stat-label">FG</div>
+        </div>
+    </div>
+    <div class="col-4 col-md-2">
+        <div class="card stat-card">
+            {% if batch.og and batch.fg %}
+                <div class="stat-value">~{{ calc_abv(batch.og, batch.fg) }}%</div>
+            {% elif batch.og %}
+                <div class="stat-value">~{{ calc_potential_abv(batch.og) }}%</div>
+            {% else %}
+                <div class="stat-value">—</div>
+            {% endif %}
+            <div class="stat-label">{% if batch.fg %}Final ABV{% else %}Potential ABV{% endif %}</div>
+        </div>
+    </div>
+    <div class="col-4 col-md-2">
+        <div class="card stat-card">
+            <div class="stat-value" style="font-size:1rem;">{{ batch.pitch_date or '—' }}</div>
+            <div class="stat-label">Pitch Date</div>
+        </div>
+    </div>
+    <div class="col-4 col-md-2">
+        <div class="card stat-card">
+            <div class="stat-value">{{ '%.3f'|format(batch.target_fg) if batch.target_fg else '—' }}</div>
+            <div class="stat-label">Target FG</div>
+        </div>
+    </div>
+    <div class="col-4 col-md-2">
+        <div class="card stat-card">
+            <div class="stat-value">{{ readings|length }}</div>
+            <div class="stat-label">Readings</div>
+        </div>
+    </div>
+</div>
+
+{% if batch.notes %}
+<div class="card mb-4">
+    <div class="card-body">
+        <small class="text-muted">Notes</small>
+        <p class="mb-0 mt-1">{{ batch.notes }}</p>
+    </div>
+</div>
+{% endif %}
+
+<!-- Gravity Chart -->
+{% if readings|length > 1 %}
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-graph-down"></i> Fermentation Progress</span>
+        <div class="btn-group btn-group-sm" role="group">
+            <input type="radio" class="btn-check" name="chartView" id="chartGravity" checked>
+            <label class="btn btn-outline-secondary" for="chartGravity">Gravity</label>
+            <input type="radio" class="btn-check" name="chartView" id="chartAbv">
+            <label class="btn btn-outline-secondary" for="chartAbv">ABV</label>
+        </div>
+    </div>
+    <div class="card-body">
+        <canvas id="fermChart" class="gravity-chart"></canvas>
+    </div>
+</div>
+{% endif %}
+
+<!-- Fermentation Log -->
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-journal-text"></i> Fermentation Log
+    </div>
+    <div class="card-body p-0">
+        {% if readings %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Day</th>
+                        <th>Gravity</th>
+                        <th>ABV</th>
+                        <th>Temp</th>
+                        <th>Notes</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for r in readings %}
+                    <tr>
+                        <td>{{ r.reading_date }}</td>
+                        <td>{{ r.day_number if r.day_number is not none else '—' }}</td>
+                        <td><strong>{{ '%.3f'|format(r.gravity) }}</strong></td>
+                        <td>{{ '~' + calc_abv(batch.og, r.gravity)|string + '%' if batch.og and calc_abv(batch.og, r.gravity) else '—' }}</td>
+                        <td>{{ r.temperature_f ~ '°F' if r.temperature_f else '—' }}</td>
+                        <td class="text-muted">{{ r.notes }}</td>
+                        <td>
+                            <form method="post" action="/gravity/{{ r.id }}/delete" class="d-inline">
+                                <button type="submit" class="btn btn-link btn-sm text-danger p-0" title="Delete">
+                                    <i class="bi bi-x"></i>
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">No gravity readings yet.</p>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/gravity" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Date</label>
+                <input type="date" name="reading_date" class="form-control form-control-sm" value="{{ today if today else '' }}">
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Gravity</label>
+                <input type="number" name="gravity" step="0.001" min="0.900" max="1.200" class="form-control form-control-sm" placeholder="1.020" required>
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Temp (°F)</label>
+                <input type="number" name="temperature_f" step="0.1" class="form-control form-control-sm" placeholder="68">
+            </div>
+            <div class="col-6 col-md-1">
+                <label class="form-label">Day #</label>
+                <input type="number" name="day_number" class="form-control form-control-sm" placeholder="auto">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control form-control-sm" placeholder="Active bubbles, etc.">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-honey btn-sm w-100">
+                    <i class="bi bi-plus"></i> Log
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Nutrient Additions -->
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-eyedropper"></i> Nutrient Schedule
+    </div>
+    <div class="card-body p-0">
+        {% if nutrients %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr><th>Date</th><th>Day</th><th>Nutrient</th><th>Amount</th><th>Notes</th></tr>
+                </thead>
+                <tbody>
+                    {% for n in nutrients %}
+                    <tr>
+                        <td>{{ n.addition_date }}</td>
+                        <td>{{ n.day_number if n.day_number is not none else '—' }}</td>
+                        <td>{{ n.nutrient_type }}</td>
+                        <td>{{ n.amount }}</td>
+                        <td class="text-muted">{{ n.notes }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">No nutrient additions logged.</p>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/nutrient" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Date</label>
+                <input type="date" name="addition_date" class="form-control form-control-sm" value="{{ today if today else '' }}">
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Type</label>
+                <select name="nutrient_type" class="form-select form-select-sm">
+                    <option>Fermaid O</option>
+                    <option>Fermaid K</option>
+                    <option>DAP</option>
+                    <option>GoFerm</option>
+                    <option>Yeast Nutrient</option>
+                    <option>Other</option>
+                </select>
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Amount</label>
+                <input type="text" name="amount" class="form-control form-control-sm" placeholder="1.5 tsp" required>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control form-control-sm" placeholder="Degassed, etc.">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-honey btn-sm w-100">
+                    <i class="bi bi-plus"></i> Log
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Ingredients -->
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-list-ul"></i> Ingredients
+    </div>
+    <div class="card-body p-0">
+        {% if ingredients %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr><th>Category</th><th>Ingredient</th><th>Amount</th><th>Notes</th></tr>
+                </thead>
+                <tbody>
+                    {% for i in ingredients %}
+                    <tr>
+                        <td><span class="badge bg-secondary">{{ i.category }}</span></td>
+                        <td>{{ i.name }}</td>
+                        <td>{{ i.amount }}</td>
+                        <td class="text-muted">{{ i.notes }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">No ingredients added.</p>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/ingredient" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Category</label>
+                <select name="category" class="form-select form-select-sm">
+                    <option value="honey">Honey</option>
+                    <option value="fruit">Fruit</option>
+                    <option value="spice">Spice</option>
+                    <option value="nutrient">Nutrient</option>
+                    <option value="yeast">Yeast</option>
+                    <option value="other">Other</option>
+                </select>
+            </div>
+            <div class="col-6 col-md-3">
+                <label class="form-label">Name</label>
+                <input type="text" name="name" class="form-control form-control-sm" placeholder="Wildflower honey" required>
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Amount</label>
+                <input type="text" name="amount" class="form-control form-control-sm" placeholder="2.5 lbs">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control form-control-sm">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-honey btn-sm w-100">
+                    <i class="bi bi-plus"></i> Add
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Tasting Notes -->
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-cup-straw"></i> Tasting Notes
+    </div>
+    <div class="card-body p-0">
+        {% if tastings %}
+        {% for t in tastings %}
+        <div class="p-3 {% if not loop.last %}border-bottom{% endif %}" style="border-color:#30363d !important;">
+            <div class="d-flex justify-content-between mb-2">
+                <strong>{{ t.tasting_date }}</strong>
+                {% if t.overall_rating %}
+                <span class="badge" style="background:var(--honey); color:#000;">
+                    {{ t.overall_rating }}/10
+                </span>
+                {% endif %}
+            </div>
+            <div class="row small">
+                {% if t.aroma %}<div class="col-6 col-md-3"><span class="text-muted">Aroma:</span> {{ t.aroma }}</div>{% endif %}
+                {% if t.flavor %}<div class="col-6 col-md-3"><span class="text-muted">Flavor:</span> {{ t.flavor }}</div>{% endif %}
+                {% if t.body %}<div class="col-6 col-md-3"><span class="text-muted">Body:</span> {{ t.body }}</div>{% endif %}
+                {% if t.sweetness %}<div class="col-6 col-md-3"><span class="text-muted">Sweetness:</span> {{ t.sweetness }}</div>{% endif %}
+            </div>
+            {% if t.notes %}<p class="text-muted small mt-2 mb-0">{{ t.notes }}</p>{% endif %}
+        </div>
+        {% endfor %}
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">No tasting notes yet.</p>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/tasting" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Date</label>
+                <input type="date" name="tasting_date" class="form-control form-control-sm" value="{{ today if today else '' }}">
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Rating (1-10)</label>
+                <input type="number" name="overall_rating" min="1" max="10" class="form-control form-control-sm" placeholder="7">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">Aroma</label>
+                <input type="text" name="aroma" class="form-control form-control-sm" placeholder="Floral, fruity">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">Flavor</label>
+                <input type="text" name="flavor" class="form-control form-control-sm" placeholder="Sweet, tart">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control form-control-sm" placeholder="Impressions...">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-honey btn-sm w-100">
+                    <i class="bi bi-plus"></i> Add
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_scripts %}
+{% if readings|length > 1 %}
+<script>
+const labels = {{ chart_labels | tojson }};
+const gravities = {{ chart_gravities | tojson }};
+const abvs = {{ chart_abvs | tojson }};
+
+const ctx = document.getElementById('fermChart').getContext('2d');
+let chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: labels,
+        datasets: [{
+            label: 'Gravity',
+            data: gravities,
+            borderColor: '#d4a017',
+            backgroundColor: 'rgba(212,160,23,0.1)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 4,
+            pointBackgroundColor: '#d4a017',
+        }]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: { display: false },
+        },
+        scales: {
+            x: {
+                grid: { color: '#30363d' },
+                ticks: { color: '#8b949e' }
+            },
+            y: {
+                grid: { color: '#30363d' },
+                ticks: { color: '#8b949e' },
+                reverse: false,
+            }
+        }
+    }
+});
+
+document.getElementById('chartGravity').addEventListener('change', function() {
+    chart.data.datasets[0].data = gravities;
+    chart.data.datasets[0].label = 'Gravity';
+    chart.data.datasets[0].borderColor = '#d4a017';
+    chart.data.datasets[0].pointBackgroundColor = '#d4a017';
+    chart.data.datasets[0].backgroundColor = 'rgba(212,160,23,0.1)';
+    chart.options.scales.y.reverse = false;
+    chart.update();
+});
+
+document.getElementById('chartAbv').addEventListener('change', function() {
+    chart.data.datasets[0].data = abvs;
+    chart.data.datasets[0].label = 'ABV %';
+    chart.data.datasets[0].borderColor = '#238636';
+    chart.data.datasets[0].pointBackgroundColor = '#238636';
+    chart.data.datasets[0].backgroundColor = 'rgba(35,134,54,0.1)';
+    chart.options.scales.y.reverse = false;
+    chart.update();
+});
+</script>
+{% endif %}
+{% endblock %}
