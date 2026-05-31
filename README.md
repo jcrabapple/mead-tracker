@@ -16,6 +16,8 @@ Built with Flask and SQLite. Dark-themed, mobile-friendly, zero dependencies bey
 - **Nutrient schedule** — Track Fermaid O/K, DAP, GoFerm, and other additions
 - **Ingredient list** — Log honey, fruit, spices, yeast, and other ingredients per batch
 - **Tasting notes** — Record aroma, flavor, body, sweetness, and 1-10 ratings
+- **Backup & restore** — Download your entire SQLite database as a `.db` file; restore from a previous backup with schema validation
+- **Export** — JSON export (full data per batch or all batches) and CSV export (spreadsheet-friendly summary)
 - **REST API** — JSON endpoints for future mobile app integration
 - **Dark UI** — Honey-themed dark mode with Bootstrap 5, fully responsive
 
@@ -69,12 +71,18 @@ mead-tracker/
 **Ingredients** → categorized (honey, fruit, spice, nutrient, yeast, other)  
 **Tasting notes** → aroma, flavor, body, sweetness, 1-10 rating
 
-## API Endpoints
+## API & Export Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/batches` | GET | All batches as JSON |
 | `/api/batch/<id>/readings` | GET | Gravity readings for a batch |
+| `/backup/download` | GET | Download full SQLite database |
+| `/backup/restore` | POST | Upload and restore a `.db` backup |
+| `/export/json` | GET | Export all batches (full data) as JSON |
+| `/export/csv` | GET | Export batch summary as CSV |
+| `/batch/<id>/export/json` | GET | Export single batch as JSON |
+| `/settings` | GET | Settings page with backup/export tools |
 
 ## Mead Styles Supported
 
