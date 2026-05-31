@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Settings — Mead Tracker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h4 class="mb-0"><i class="bi bi-gear"></i> Settings</h4>
+</div>
+
+<div class="row g-4">
+    <!-- Database Info -->
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header"><i class="bi bi-database"></i> Database</div>
+            <div class="card-body">
+                <div class="row text-center">
+                    <div class="col-6">
+                        <div class="stat-value">{{ batch_count }}</div>
+                        <div class="stat-label">Batches</div>
+                    </div>
+                    <div class="col-6">
+                        <div class="stat-value">{{ reading_count }}</div>
+                        <div class="stat-label">Gravity Readings</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Backup -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-download"></i> Backup</div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Download a copy of your entire database. This file can be restored later
+                    using the restore option below.
+                </p>
+                <a href="/backup/download" class="btn btn-honey w-100">
+                    <i class="bi bi-download"></i> Download Backup (.db)
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Restore -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-upload"></i> Restore</div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Replace your current database with a previously downloaded backup.
+                    <strong class="text-warning">This will overwrite all current data.</strong>
+                </p>
+                <form method="post" action="/backup/restore" enctype="multipart/form-data"
+                      onsubmit="return confirm('This will replace ALL current data with the backup. Continue?')">
+                    <div class="mb-3">
+                        <input type="file" name="backup_file" accept=".db"
+                               class="form-control form-control-sm" required>
+                    </div>
+                    <button type="submit" class="btn btn-outline-warning w-100">
+                        <i class="bi bi-upload"></i> Restore from Backup
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export JSON -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-filetype-json"></i> Export JSON</div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Export all batches with full data — gravity readings, nutrients,
+                    ingredients, and tasting notes — as a structured JSON file.
+                </p>
+                <a href="/export/json" class="btn btn-outline-secondary w-100">
+                    <i class="bi bi-filetype-json"></i> Export All as JSON
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export CSV -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header"><i class="bi bi-filetype-csv"></i> Export CSV</div>
+            <div class="card-body">
+                <p class="text-muted small">
+                    Export batch summary data as CSV — one row per batch with
+                    latest gravity, ABV, and ingredient list. Opens in any spreadsheet app.
+                </p>
+                <a href="/export/csv" class="btn btn-outline-secondary w-100">
+                    <i class="bi bi-filetype-csv"></i> Export All as CSV
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Per-batch export hint -->
+<div class="card mt-4">
+    <div class="card-body">
+        <p class="mb-0 small text-muted">
+            <i class="bi bi-info-circle"></i>
+            You can also export individual batches from the batch detail page
+            using the <strong>Export JSON</strong> button.
+        </p>
+    </div>
+</div>
+{% endblock %}

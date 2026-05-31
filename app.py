@@ -1,14 +1,19 @@
 """Mead Batch Tracker — lightweight Flask app for tracking homebrew mead batches."""
 
 import os
+import io
+import csv
+import json
+import shutil
 import sqlite3
 from datetime import datetime, date
 from contextlib import contextmanager
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    jsonify, flash, g
+    jsonify, flash, g, send_file, Response
 )
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -421,6 +426,183 @@ def add_ingredient(batch_id):
     db.commit()
     flash(f"Ingredient added: {request.form['name']}.", "success")
     return redirect(url_for("batch_detail", batch_id=batch_id))
+
+
+# ── Backup / Restore / Export ───────────────────────────────────
+
+def _export_batch_dict(db, batch_id):
+    """Build a full dict for one batch including all related data."""
+    batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if not batch:
+        return None
+    data = dict(batch)
+    data["gravity_readings"] = [
+        dict(r) for r in db.execute(
+            "SELECT * FROM gravity_readings WHERE batch_id = ? ORDER BY reading_date",
+            (batch_id,),
+        ).fetchall()
+    ]
+    data["nutrient_additions"] = [
+        dict(n) for n in db.execute(
+            "SELECT * FROM nutrient_additions WHERE batch_id = ? ORDER BY addition_date",
+            (batch_id,),
+        ).fetchall()
+    ]
+    data["ingredients"] = [
+        dict(i) for i in db.execute(
+            "SELECT * FROM ingredients WHERE batch_id = ? ORDER BY category, name",
+            (batch_id,),
+        ).fetchall()
+    ]
+    data["tasting_notes"] = [
+        dict(t) for t in db.execute(
+            "SELECT * FROM tasting_notes WHERE batch_id = ? ORDER BY tasting_date DESC",
+            (batch_id,),
+        ).fetchall()
+    ]
+    return data
+
+
+@app.route("/settings")
+def settings():
+    db = get_db()
+    batch_count = db.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
+    reading_count = db.execute("SELECT COUNT(*) FROM gravity_readings").fetchone()[0]
+    return render_template("settings.html",
+                           batch_count=batch_count,
+                           reading_count=reading_count)
+
+
+@app.route("/backup/download")
+def backup_download():
+    """Download a copy of the SQLite database."""
+    if not os.path.exists(DB_PATH):
+        flash("No database found.", "danger")
+        return redirect(url_for("settings"))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        DB_PATH,
+        as_attachment=True,
+        download_name=f"mead-tracker-backup_{timestamp}.db",
+        mimetype="application/x-sqlite3",
+    )
+
+
+@app.route("/backup/restore", methods=["POST"])
+def backup_restore():
+    """Replace the current database with an uploaded .db file."""
+    file = request.files.get("backup_file")
+    if not file or file.filename == "":
+        flash("No file selected.", "danger")
+        return redirect(url_for("settings"))
+
+    if not file.filename.endswith(".db"):
+        flash("Only .db files are accepted.", "danger")
+        return redirect(url_for("settings"))
+
+    # Verify it's a valid SQLite database
+    try:
+        tmp_path = DB_PATH + ".tmp"
+        file.save(tmp_path)
+        test = sqlite3.connect(tmp_path)
+        # Quick sanity: check that the batches table exists
+        tables = {row[0] for row in test.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        test.close()
+        if "batches" not in tables:
+            os.remove(tmp_path)
+            flash("Invalid backup: missing 'batches' table.", "danger")
+            return redirect(url_for("settings"))
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        flash(f"Invalid SQLite file: {e}", "danger")
+        return redirect(url_for("settings"))
+
+    # Replace the database
+    shutil.move(tmp_path, DB_PATH)
+    flash("Database restored successfully! Refresh to see your data.", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/export/json")
+def export_json():
+    """Export all batches with full data as JSON."""
+    db = get_db()
+    batch_ids = [row["id"] for row in db.execute("SELECT id FROM batches").fetchall()]
+    data = [_export_batch_dict(db, bid) for bid in batch_ids]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        json.dumps(data, indent=2, default=str),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename=mead-tracker_{timestamp}.json"},
+    )
+
+
+@app.route("/export/csv")
+def export_csv():
+    """Export all batches as CSV (one row per batch with summary data)."""
+    db = get_db()
+    batches = db.execute("SELECT * FROM batches ORDER BY pitch_date DESC").fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "name", "style", "batch_size_gal", "honey_type", "yeast_strain",
+        "og", "fg", "target_fg", "target_abv", "status", "pitch_date",
+        "bottled_date", "notes", "recipe_source", "readings_count",
+        "latest_gravity", "current_abv", "ingredients", "created_at",
+    ])
+
+    for b in batches:
+        latest = db.execute(
+            "SELECT gravity FROM gravity_readings WHERE batch_id = ? "
+            "ORDER BY reading_date DESC LIMIT 1", (b["id"],)
+        ).fetchone()
+        reading_count = db.execute(
+            "SELECT COUNT(*) FROM gravity_readings WHERE batch_id = ?", (b["id"],)
+        ).fetchone()[0]
+        ingredients = "; ".join(
+            f"{i['name']} ({i['amount']})" if i["amount"] else i["name"]
+            for i in db.execute(
+                "SELECT name, amount FROM ingredients WHERE batch_id = ? ORDER BY category, name",
+                (b["id"],)
+            ).fetchall()
+        )
+        current_abv = calc_abv(b["og"], latest["gravity"]) if latest and b["og"] else ""
+        writer.writerow([
+            b["id"], b["name"], b["style"], b["batch_size_gal"],
+            b["honey_type"], b["yeast_strain"], b["og"] or "", b["fg"] or "",
+            b["target_fg"] or "", b["target_abv"] or "", b["status"],
+            b["pitch_date"], b["bottled_date"], b["notes"], b["recipe_source"],
+            reading_count, latest["gravity"] if latest else "", current_abv,
+            ingredients, b["created_at"],
+        ])
+
+    output.seek(0)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=mead-tracker_{timestamp}.csv"},
+    )
+
+
+@app.route("/batch/<int:batch_id>/export/json")
+def export_batch_json(batch_id):
+    """Export a single batch with full data as JSON."""
+    db = get_db()
+    data = _export_batch_dict(db, batch_id)
+    if not data:
+        flash("Batch not found.", "danger")
+        return redirect(url_for("index"))
+    safe_name = data["name"].replace(" ", "_").lower()
+    return Response(
+        json.dumps(data, indent=2, default=str),
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment; filename=mead_{safe_name}_{batch_id}.json"},
+    )
 
 
 # ── API (for charts / future mobile app) ─────────────────────────
