@@ -18,6 +18,7 @@ from werkzeug.utils import secure_filename
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from notifications import check_and_send_notifications, send_email, send_ntfy
+import requests as http_requests
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -147,6 +148,13 @@ def init_db():
             sent_at TEXT DEFAULT (datetime('now')),
             status TEXT DEFAULT 'sent',
             error TEXT
+        );
+        -- AI recipe generation settings
+        CREATE TABLE IF NOT EXISTS ai_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL UNIQUE,
+            value TEXT DEFAULT '',
+            updated_at TEXT DEFAULT (datetime('now'))
         );
     """)
     db.close()
@@ -539,11 +547,20 @@ def settings():
         "SELECT * FROM notification_log ORDER BY sent_at DESC LIMIT 20"
     ).fetchall()
 
+    # Load AI settings
+    ai_config = {
+        "api_base_url": get_ai_setting(db, "api_base_url"),
+        "api_key": get_ai_setting(db, "api_key"),
+        "model_name": get_ai_setting(db, "model_name"),
+        "custom_system_prompt": get_ai_setting(db, "custom_system_prompt"),
+    }
+
     return render_template("settings.html",
                            batch_count=batch_count,
                            reading_count=reading_count,
                            notif_settings=notif_settings_dict,
-                           recent_log=recent_log)
+                           recent_log=recent_log,
+                           ai_config=ai_config)
 
 
 @app.route("/backup/download")
@@ -844,6 +861,229 @@ def api_notifications_log():
         "SELECT * FROM notification_log ORDER BY sent_at DESC LIMIT 50"
     ).fetchall()
     return jsonify([dict(e) for e in log_entries])
+
+
+# ── AI Recipe Generation ──────────────────────────────────────────
+
+DEFAULT_SYSTEM_PROMPT = """You are an expert mead maker and homebrew specialist with 15+ years of experience. You have deep knowledge of fermentation science, microbiology, chemistry, and mead production techniques.
+
+When generating a recipe, always include ALL of the following sections:
+
+1. **Recipe Name** — a creative, descriptive name
+2. **Style** — the mead style (traditional, melomel, metheglin, sack mead, session mead, etc.)
+3. **Batch Specifications** — batch size, target OG, target FG, estimated ABV
+4. **Ingredients** — complete list with exact amounts:
+   - Honey: type recommendation and amount in pounds
+   - Water: volume and any water chemistry notes
+   - Yeast: specific strain recommendation, pitch rate, and why it fits
+   - Nutrients: specific TOSNA or SNA schedule with exact amounts (Fermaid O, Fermaid K, DAP, GoFerm)
+   - Any additional ingredients (fruit, spices, etc.) with amounts and timing
+5. **Process Instructions** — step-by-step:
+   - Must preparation (mixing, temperature, aeration)
+   - Primary fermentation details (temperature, duration, airlock)
+   - Nutrient schedule (which days, what to add, degassing notes)
+   - Secondary fermentation / racking timing
+   - Aging recommendations (duration, vessel, temperature)
+   - Packaging (bottling or kegging, back-sweetening if applicable)
+6. **Timeline** — day-by-day or week-by-week summary of key milestones
+7. **Notes** — any tips, warnings, or variations
+
+Be specific with measurements. Use real yeast strain names (Lalvin EC-1118, K1-V1116, QA23, D47, 71B, etc.). Recommend a nutrient protocol that matches the yeast and gravity. Always consider the balance between sweetness, acidity, and alcohol. If ingredients are provided that don't pair well together, say so honestly."""
+
+
+def get_ai_setting(db, key, default=""):
+    """Read a single AI setting value."""
+    row = db.execute("SELECT value FROM ai_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_ai_setting(db, key, value):
+    """Write a single AI setting value (upsert)."""
+    existing = db.execute("SELECT id FROM ai_settings WHERE key = ?", (key,)).fetchone()
+    if existing:
+        db.execute("UPDATE ai_settings SET value = ?, updated_at = datetime('now') WHERE key = ?", (value, key))
+    else:
+        db.execute("INSERT INTO ai_settings (key, value) VALUES (?, ?)", (key, value))
+
+
+@app.route("/recipe/generate", methods=["GET"])
+def recipe_generate_page():
+    """Show the AI recipe generation form."""
+    db = get_db()
+    ai_config = {
+        "api_base_url": get_ai_setting(db, "api_base_url"),
+        "api_key": get_ai_setting(db, "api_key"),
+        "model_name": get_ai_setting(db, "model_name"),
+        "custom_system_prompt": get_ai_setting(db, "custom_system_prompt"),
+    }
+    return render_template("recipe_generator.html", ai_config=ai_config, recipe_result=None)
+
+
+@app.route("/recipe/generate", methods=["POST"])
+def recipe_generate():
+    """Generate a recipe via the configured OpenAI-compatible API."""
+    db = get_db()
+
+    # Load AI config
+    api_base_url = get_ai_setting(db, "api_base_url").strip()
+    api_key = get_ai_setting(db, "api_key").strip()
+    model_name = get_ai_setting(db, "model_name").strip()
+    custom_prompt = get_ai_setting(db, "custom_system_prompt").strip()
+
+    if not api_base_url or not api_key or not model_name:
+        flash("AI recipe generation is not configured. Please set your API base URL, API key, and model in Settings.", "danger")
+        return redirect(url_for("settings"))
+
+    # Build the user prompt from form inputs
+    batch_size = request.form.get("batch_size", "").strip()
+    honey_amount = request.form.get("honey_amount", "").strip()
+    target_abv = request.form.get("target_abv", "").strip()
+    ingredients = request.form.get("ingredients", "").strip()
+    extra_notes = request.form.get("extra_notes", "").strip()
+
+    if not batch_size or not honey_amount:
+        flash("Batch size and honey amount are required.", "danger")
+        return redirect(url_for("recipe_generate_page"))
+
+    user_prompt = f"Generate a mead recipe with these specifications:\n\n"
+    user_prompt += f"- Batch size: {batch_size} gallons\n"
+    user_prompt += f"- Honey amount: {honey_amount} lbs\n"
+    if target_abv:
+        user_prompt += f"- Target ABV: {target_abv}%\n"
+    if ingredients:
+        user_prompt += f"- Additional ingredients: {ingredients}\n"
+    if extra_notes:
+        user_prompt += f"- Additional notes: {extra_notes}\n"
+    user_prompt += "\nPlease provide a complete, detailed recipe following the format in your instructions."
+
+    system_prompt = custom_prompt if custom_prompt else DEFAULT_SYSTEM_PROMPT
+
+    # Call the OpenAI-compatible API
+    try:
+        # Normalize base URL — strip trailing slash
+        base = api_base_url.rstrip("/")
+        # If user provided a full endpoint, use it; otherwise append /chat/completions
+        if base.endswith("/chat/completions"):
+            endpoint = base
+        elif base.endswith("/v1"):
+            endpoint = f"{base}/chat/completions"
+        else:
+            endpoint = f"{base}/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 4096,
+        }
+
+        resp = http_requests.post(endpoint, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+        result = resp.json()
+
+        recipe_text = result["choices"][0]["message"]["content"]
+
+        # Store the config for the template
+        ai_config = {
+            "api_base_url": api_base_url,
+            "api_key": api_key,
+            "model_name": model_name,
+            "custom_system_prompt": custom_prompt,
+        }
+
+        # Pass back the form values so the user doesn't lose them
+        form_data = {
+            "batch_size": batch_size,
+            "honey_amount": honey_amount,
+            "target_abv": target_abv,
+            "ingredients": ingredients,
+            "extra_notes": extra_notes,
+        }
+
+        flash("Recipe generated!", "success")
+        return render_template("recipe_generator.html",
+                               ai_config=ai_config,
+                               recipe_result=recipe_text,
+                               form_data=form_data)
+
+    except http_requests.exceptions.Timeout:
+        flash("Recipe generation timed out. The model may be too slow or the API is unreachable.", "danger")
+    except http_requests.exceptions.HTTPError as e:
+        error_detail = ""
+        try:
+            error_detail = e.response.json().get("error", {}).get("message", str(e))
+        except Exception:
+            error_detail = str(e)
+        flash(f"API error: {error_detail}", "danger")
+    except Exception as e:
+        logger.error("Recipe generation failed: %s", e)
+        flash(f"Recipe generation failed: {e}", "danger")
+
+    return redirect(url_for("recipe_generate_page"))
+
+
+@app.route("/settings/ai", methods=["POST"])
+def save_ai_settings():
+    """Save AI recipe generation settings."""
+    db = get_db()
+    set_ai_setting(db, "api_base_url", request.form.get("ai_api_base_url", "").strip())
+    set_ai_setting(db, "api_key", request.form.get("ai_api_key", "").strip())
+    set_ai_setting(db, "model_name", request.form.get("ai_model_name", "").strip())
+    set_ai_setting(db, "custom_system_prompt", request.form.get("ai_custom_system_prompt", "").strip())
+    db.commit()
+    flash("AI settings saved.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/ai/test", methods=["POST"])
+def test_ai_connection():
+    """Test the AI API connection by sending a simple request."""
+    db = get_db()
+    api_base_url = get_ai_setting(db, "api_base_url").strip()
+    api_key = get_ai_setting(db, "api_key").strip()
+    model_name = get_ai_setting(db, "model_name").strip()
+
+    if not api_base_url or not api_key or not model_name:
+        flash("Please fill in all AI settings before testing.", "danger")
+        return redirect(url_for("settings"))
+
+    try:
+        base = api_base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            endpoint = base
+        elif base.endswith("/v1"):
+            endpoint = f"{base}/chat/completions"
+        else:
+            endpoint = f"{base}/v1/chat/completions"
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "user", "content": "Say 'Mead Tracker AI connection successful!' in exactly those words."},
+            ],
+            "max_tokens": 50,
+        }
+
+        resp = http_requests.post(endpoint, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        reply = result["choices"][0]["message"]["content"]
+        flash(f"AI connection successful! Model replied: {reply}", "success")
+    except Exception as e:
+        flash(f"AI connection test failed: {e}", "danger")
+
+    return redirect(url_for("settings"))
 
 
 # ── API (for charts / future mobile app) ─────────────────────────
