@@ -366,6 +366,127 @@
     </div>
 </div>
 
+<!-- Notifications Section (after Tasting Notes) -->
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-bell"></i> Notifications
+    </div>
+    <div class="card-body">
+        {% set nutrient_rule = notif_rules.get('nutrient_reminder', {}) %}
+        {% set gravity_rule = notif_rules.get('gravity_reminder', {}) %}
+        {% set aging_rule = notif_rules.get('aging_milestone', {}) %}
+
+        {% set is_active = batch.status == 'active' %}
+        {% set is_aging = batch.status in ('aging', 'bottled') %}
+
+        <form method="post" action="/batch/{{ batch.id }}/notifications">
+            <!-- Nutrient Reminder -->
+            <div class="mb-3">
+                <div class="d-flex align-items-center justify-content-between mb-2">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch"
+                               name="notif_enabled_nutrient_reminder" id="nrEnabled"
+                               style="border-color: #d4a017;"
+                               {% if nutrient_rule.get('enabled', 1 if is_active else 0) %}checked{% endif %}>
+                        <label class="form-check-label" for="nrEnabled">
+                            <i class="bi bi-eyedropper" style="color: #d4a017;"></i>
+                            Nutrient Addition Reminders
+                        </label>
+                    </div>
+                    {% if is_active %}
+                        <span class="badge bg-success badge-sm">Active</span>
+                    {% endif %}
+                </div>
+                <p class="text-muted small mb-1">Remind you to add nutrients on days 1, 2, 3, 4 after pitch.</p>
+                <div class="row g-2">
+                    <div class="col-6">
+                        <label class="form-label small">Lead Time (days before)</label>
+                        <input type="number" name="notif_lead_nutrient_reminder"
+                               class="form-control form-control-sm"
+                               value="{{ nutrient_rule.get('lead_time_days', 0) }}" min="0" placeholder="0">
+                    </div>
+                </div>
+            </div>
+
+            <hr style="border-color:#30363d;">
+
+            <!-- Gravity Reminder -->
+            <div class="mb-3">
+                <div class="d-flex align-items-center justify-content-between mb-2">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch"
+                               name="notif_enabled_gravity_reminder" id="grEnabled"
+                               style="border-color: #d4a017;"
+                               {% if gravity_rule.get('enabled', 1 if is_active else 0) %}checked{% endif %}>
+                        <label class="form-check-label" for="grEnabled">
+                            <i class="bi bi-graph-down" style="color: #d4a017;"></i>
+                            Gravity Reading Reminders
+                        </label>
+                    </div>
+                    {% if is_active or is_aging %}
+                        <span class="badge bg-success badge-sm">Active</span>
+                    {% endif %}
+                </div>
+                <p class="text-muted small mb-1">Remind you to take gravity readings at regular intervals.</p>
+                <div class="row g-2">
+                    <div class="col-6">
+                        <label class="form-label small">Interval (days)</label>
+                        <input type="number" name="notif_interval_gravity_reminder"
+                               class="form-control form-control-sm"
+                               value="{{ gravity_rule.get('interval_days', 7) }}" min="1" placeholder="7">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small">Lead Time (days before)</label>
+                        <input type="number" name="notif_lead_gravity_reminder"
+                               class="form-control form-control-sm"
+                               value="{{ gravity_rule.get('lead_time_days', 0) }}" min="0" placeholder="0">
+                    </div>
+                </div>
+            </div>
+
+            <hr style="border-color:#30363d;">
+
+            <!-- Aging Milestone -->
+            <div class="mb-3">
+                <div class="d-flex align-items-center justify-content-between mb-2">
+                    <div class="form-check form-switch mb-0">
+                        <input class="form-check-input" type="checkbox" role="switch"
+                               name="notif_enabled_aging_milestone" id="amEnabled"
+                               style="border-color: #d4a017;"
+                               {% if aging_rule.get('enabled', 1 if is_aging else 0) %}checked{% endif %}>
+                        <label class="form-check-label" for="amEnabled">
+                            <i class="bi bi-calendar-check" style="color: #d4a017;"></i>
+                            Aging Milestones
+                        </label>
+                    </div>
+                    {% if is_aging %}
+                        <span class="badge bg-success badge-sm">Active</span>
+                    {% endif %}
+                </div>
+                <p class="text-muted small mb-1">Notify at aging milestones (30, 60, 90, 180, 365 days).</p>
+                <div class="row g-2">
+                    <div class="col-6">
+                        <label class="form-label small">Lead Time (days before)</label>
+                        <input type="number" name="notif_lead_aging_milestone"
+                               class="form-control form-control-sm"
+                               value="{{ aging_rule.get('lead_time_days', 3) }}" min="0" placeholder="3">
+                    </div>
+                    <div class="col-6">
+                        <label class="form-label small">Interval (days)</label>
+                        <input type="number" name="notif_interval_aging_milestone"
+                               class="form-control form-control-sm"
+                               value="{{ aging_rule.get('interval_days', 0) }}" min="0" placeholder="0">
+                    </div>
+                </div>
+            </div>
+
+            <button type="submit" class="btn btn-honey btn-sm w-100 mt-2">
+                <i class="bi bi-save"></i> Save Notification Settings
+            </button>
+        </form>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block extra_scripts %}

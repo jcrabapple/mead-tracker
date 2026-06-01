@@ -6,6 +6,7 @@ import csv
 import json
 import shutil
 import sqlite3
+import logging
 from datetime import datetime, date
 from contextlib import contextmanager
 
@@ -14,11 +15,17 @@ from flask import (
     jsonify, flash, g, send_file, Response
 )
 from werkzeug.utils import secure_filename
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from notifications import check_and_send_notifications, send_email, send_ntfy
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mead.db")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # ── Database helpers ──────────────────────────────────────────────
@@ -108,6 +115,39 @@ def init_db():
             amount TEXT DEFAULT '',
             notes TEXT DEFAULT ''
         );
+
+        -- Notification system tables
+        CREATE TABLE IF NOT EXISTS notification_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT NOT NULL CHECK(channel IN ('email', 'ntfy')),
+            enabled INTEGER DEFAULT 0,
+            config TEXT DEFAULT '{}',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS notification_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER REFERENCES batches(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL CHECK(event_type IN ('nutrient_reminder', 'gravity_reminder', 'aging_milestone')),
+            enabled INTEGER DEFAULT 1,
+            lead_time_days INTEGER DEFAULT 0,
+            interval_days INTEGER DEFAULT 0,
+            last_notified TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS notification_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER,
+            channel TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            subject TEXT,
+            body TEXT,
+            sent_at TEXT DEFAULT (datetime('now')),
+            status TEXT DEFAULT 'sent',
+            error TEXT
+        );
     """)
     db.close()
 
@@ -129,6 +169,17 @@ def calc_potential_abv(og):
 
 
 app.jinja_env.globals.update(calc_abv=calc_abv, calc_potential_abv=calc_potential_abv)
+
+
+@app.template_filter("from_json")
+def from_json_filter(value):
+    """Jinja filter to parse JSON string into a Python object."""
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 @app.context_processor
@@ -223,6 +274,13 @@ def batch_detail(batch_id):
         (batch_id,),
     ).fetchall()
 
+    # Load notification rules for this batch
+    notif_rules = db.execute(
+        "SELECT * FROM notification_rules WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchall()
+    notif_rules_dict = {r["event_type"]: dict(r) for r in notif_rules}
+
     # Build chart data
     chart_labels = [r["reading_date"] for r in readings]
     chart_gravities = [r["gravity"] for r in readings]
@@ -241,6 +299,7 @@ def batch_detail(batch_id):
         chart_labels=chart_labels,
         chart_gravities=chart_gravities,
         chart_abvs=chart_abvs,
+        notif_rules=notif_rules_dict,
     )
 
 
@@ -468,9 +527,23 @@ def settings():
     db = get_db()
     batch_count = db.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
     reading_count = db.execute("SELECT COUNT(*) FROM gravity_readings").fetchone()[0]
+
+    # Load notification settings
+    notif_settings = db.execute(
+        "SELECT * FROM notification_settings"
+    ).fetchall()
+    notif_settings_dict = {s["channel"]: dict(s) for s in notif_settings}
+
+    # Load recent notification log
+    recent_log = db.execute(
+        "SELECT * FROM notification_log ORDER BY sent_at DESC LIMIT 20"
+    ).fetchall()
+
     return render_template("settings.html",
                            batch_count=batch_count,
-                           reading_count=reading_count)
+                           reading_count=reading_count,
+                           notif_settings=notif_settings_dict,
+                           recent_log=recent_log)
 
 
 @app.route("/backup/download")
@@ -605,6 +678,174 @@ def export_batch_json(batch_id):
     )
 
 
+# ── Notification Settings Routes ──────────────────────────────────
+
+@app.route("/settings/notifications/email", methods=["POST"])
+def save_email_notification_settings():
+    """Save email notification settings."""
+    db = get_db()
+    config = {
+        "host": request.form.get("smtp_host", ""),
+        "port": int(request.form.get("smtp_port", 587)),
+        "username": request.form.get("smtp_username", ""),
+        "password": request.form.get("smtp_password", ""),
+        "from_addr": request.form.get("from_addr", ""),
+        "to_addr": request.form.get("to_addr", ""),
+        "use_tls": request.form.get("use_tls") == "on",
+    }
+    enabled = 1 if request.form.get("enabled") == "on" else 0
+    config_json = json.dumps(config)
+
+    existing = db.execute(
+        "SELECT id FROM notification_settings WHERE channel = 'email'"
+    ).fetchone()
+    if existing:
+        db.execute(
+            "UPDATE notification_settings SET enabled = ?, config = ?, updated_at = datetime('now') WHERE channel = 'email'",
+            (enabled, config_json),
+        )
+    else:
+        db.execute(
+            "INSERT INTO notification_settings (channel, enabled, config) VALUES ('email', ?, ?)",
+            (enabled, config_json),
+        )
+    db.commit()
+    flash("Email notification settings saved.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/notifications/ntfy", methods=["POST"])
+def save_ntfy_notification_settings():
+    """Save ntfy notification settings."""
+    db = get_db()
+    config = {
+        "server_url": request.form.get("ntfy_server_url", "https://ntfy.sh"),
+        "topic": request.form.get("ntfy_topic", ""),
+        "priority": request.form.get("ntfy_priority", "default"),
+    }
+    enabled = 1 if request.form.get("enabled") == "on" else 0
+    config_json = json.dumps(config)
+
+    existing = db.execute(
+        "SELECT id FROM notification_settings WHERE channel = 'ntfy'"
+    ).fetchone()
+    if existing:
+        db.execute(
+            "UPDATE notification_settings SET enabled = ?, config = ?, updated_at = datetime('now') WHERE channel = 'ntfy'",
+            (enabled, config_json),
+        )
+    else:
+        db.execute(
+            "INSERT INTO notification_settings (channel, enabled, config) VALUES ('ntfy', ?, ?)",
+            (enabled, config_json),
+        )
+    db.commit()
+    flash("ntfy notification settings saved.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/notifications/test/<channel>", methods=["POST"])
+def test_notification(channel):
+    """Send a test notification via the specified channel."""
+    if channel not in ("email", "ntfy"):
+        flash("Invalid notification channel.", "danger")
+        return redirect(url_for("settings"))
+
+    db = get_db()
+    setting = db.execute(
+        "SELECT * FROM notification_settings WHERE channel = ?", (channel,)
+    ).fetchone()
+
+    if not setting:
+        flash(f"No settings configured for {channel}.", "danger")
+        return redirect(url_for("settings"))
+
+    config = json.loads(setting["config"]) if setting["config"] else {}
+    subject = f"🧪 Test Notification — Mead Tracker"
+    body = (
+        f"This is a test notification from Mead Tracker.\n\n"
+        f"Channel: {channel}\n"
+        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"If you're reading this, your notification setup is working!"
+    )
+
+    try:
+        if channel == "email":
+            send_email(config, subject, body)
+        elif channel == "ntfy":
+            send_ntfy(config, subject, body)
+
+        # Log the test notification
+        db.execute(
+            """INSERT INTO notification_log (batch_id, channel, event_type, subject, body, status)
+               VALUES (NULL, ?, 'test', ?, ?, 'sent')""",
+            (channel, subject, body),
+        )
+        db.commit()
+        flash(f"Test {channel} notification sent successfully!", "success")
+    except Exception as e:
+        logger.error("Test notification failed for %s: %s", channel, e)
+        db.execute(
+            """INSERT INTO notification_log (batch_id, channel, event_type, subject, body, status, error)
+               VALUES (NULL, ?, 'test', ?, ?, 'error', ?)""",
+            (channel, subject, body, str(e)),
+        )
+        db.commit()
+        flash(f"Test {channel} notification failed: {e}", "danger")
+
+    return redirect(url_for("settings"))
+
+
+@app.route("/batch/<int:batch_id>/notifications", methods=["POST"])
+def save_batch_notification_rules(batch_id):
+    """Update notification rules for a batch."""
+    db = get_db()
+    batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if not batch:
+        flash("Batch not found.", "danger")
+        return redirect(url_for("index"))
+
+    event_types = ["nutrient_reminder", "gravity_reminder", "aging_milestone"]
+    for event_type in event_types:
+        enabled = 1 if request.form.get(f"notif_enabled_{event_type}") == "on" else 0
+        lead_time_days = int(request.form.get(f"notif_lead_{event_type}", 0) or 0)
+        interval_days = int(request.form.get(f"notif_interval_{event_type}", 0) or 0)
+
+        existing = db.execute(
+            "SELECT id FROM notification_rules WHERE batch_id = ? AND event_type = ?",
+            (batch_id, event_type),
+        ).fetchone()
+
+        if existing:
+            db.execute(
+                """UPDATE notification_rules SET
+                   enabled = ?, lead_time_days = ?, interval_days = ?
+                   WHERE id = ?""",
+                (enabled, lead_time_days, interval_days, existing["id"]),
+            )
+        else:
+            db.execute(
+                """INSERT INTO notification_rules
+                   (batch_id, event_type, enabled, lead_time_days, interval_days)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (batch_id, event_type, enabled, lead_time_days, interval_days),
+            )
+
+    db.commit()
+    flash("Notification rules updated!", "success")
+    return redirect(url_for("batch_detail", batch_id=batch_id))
+
+
+@app.route("/api/notifications/log")
+def api_notifications_log():
+    """Return recent notification log entries as JSON."""
+    db = get_db()
+    log_entries = db.execute(
+        "SELECT * FROM notification_log ORDER BY sent_at DESC LIMIT 50"
+    ).fetchall()
+    return jsonify([dict(e) for e in log_entries])
+
+
 # ── API (for charts / future mobile app) ─────────────────────────
 
 @app.route("/api/batches")
@@ -622,6 +863,20 @@ def api_readings(batch_id):
         (batch_id,),
     ).fetchall()
     return jsonify([dict(r) for r in readings])
+
+
+# ── Background Scheduler ──────────────────────────────────────────
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(
+    check_and_send_notifications,
+    'interval',
+    hours=1,
+    args=[app, DB_PATH],
+    id='check_notifications',
+    replace_existing=True,
+)
+scheduler.start()
 
 
 # ── Entry point ───────────────────────────────────────────────────

@@ -108,4 +108,198 @@
         </p>
     </div>
 </div>
+
+<!-- ──── Notifications Section ──── -->
+<div class="mt-4">
+    <h5 class="mb-3"><i class="bi bi-bell"></i> Notifications</h5>
+</div>
+
+<div class="row g-4">
+    <!-- Email Notifications -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-envelope"></i> Email Notifications</span>
+                <span id="emailStatusBadge" class="badge {% if notif_settings and notif_settings.email and notif_settings.email.enabled %}bg-success{% else %}bg-secondary{% endif %}">
+                    {{ 'Enabled' if notif_settings and notif_settings.email and notif_settings.email.enabled else 'Disabled' }}
+                </span>
+            </div>
+            <div class="card-body">
+                {% set email_config = (notif_settings.email.config | from_json) if notif_settings and notif_settings.email and notif_settings.email.config else {} %}
+                {% set email_enabled = notif_settings.email.enabled if notif_settings and notif_settings.email else 0 %}
+                <form method="post" action="/settings/notifications/email">
+                    <div class="mb-3">
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" role="switch"
+                                   name="enabled" id="emailEnabled"
+                                   style="border-color: #d4a017;"
+                                   onchange="this.form.querySelector('#emailStatusBadge').textContent = this.checked ? 'Enabled' : 'Disabled';"
+                                   {% if email_enabled %}checked{% endif %}>
+                            <label class="form-check-label" for="emailEnabled">Enable Email Notifications</label>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label">SMTP Host</label>
+                        <input type="text" name="smtp_host" class="form-control form-control-sm"
+                               value="{{ email_config.get('host', '') }}" placeholder="smtp.gmail.com">
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-6">
+                            <label class="form-label">SMTP Port</label>
+                            <input type="number" name="smtp_port" class="form-control form-control-sm"
+                                   value="{{ email_config.get('port', 587) }}" placeholder="587">
+                        </div>
+                        <div class="col-6 d-flex align-items-end pb-1">
+                            <div class="form-check">
+                                <input type="checkbox" class="form-check-input" name="use_tls" id="useTls"
+                                       style="border-color: #d4a017;"
+                                       {% if email_config.get('use_tls', True) %}checked{% endif %}>
+                                <label class="form-check-label small" for="useTls">Use TLS</label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label">Username</label>
+                        <input type="text" name="smtp_username" class="form-control form-control-sm"
+                               value="{{ email_config.get('username', '') }}" placeholder="user@gmail.com">
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label">Password</label>
+                        <input type="password" name="smtp_password" class="form-control form-control-sm"
+                               value="{{ email_config.get('password', '') }}" placeholder="App password">
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label">From Address</label>
+                        <input type="email" name="from_addr" class="form-control form-control-sm"
+                               value="{{ email_config.get('from_addr', '') }}" placeholder="mead@example.com">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">To Address</label>
+                        <input type="email" name="to_addr" class="form-control form-control-sm"
+                               value="{{ email_config.get('to_addr', '') }}" placeholder="you@example.com">
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-honey btn-sm">
+                            <i class="bi bi-save"></i> Save
+                        </button>
+                        <button type="submit" formaction="/settings/notifications/test/email"
+                                formmethod="post" class="btn btn-outline-secondary btn-sm">
+                            <i class="bi bi-send"></i> Send Test Email
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- ntfy Notifications -->
+    <div class="col-md-6">
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-phone"></i> ntfy Push Notifications</span>
+                <span id="ntfyStatusBadge" class="badge {% if notif_settings and notif_settings.ntfy and notif_settings.ntfy.enabled %}bg-success{% else %}bg-secondary{% endif %}">
+                    {{ 'Enabled' if notif_settings and notif_settings.ntfy and notif_settings.ntfy.enabled else 'Disabled' }}
+                </span>
+            </div>
+            <div class="card-body">
+                {% set ntfy_config = (notif_settings.ntfy.config | from_json) if notif_settings and notif_settings.ntfy and notif_settings.ntfy.config else {} %}
+                {% set ntfy_enabled = notif_settings.ntfy.enabled if notif_settings and notif_settings.ntfy else 0 %}
+                <form method="post" action="/settings/notifications/ntfy">
+                    <div class="mb-3">
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" role="switch"
+                                   name="enabled" id="ntfyEnabled"
+                                   style="border-color: #d4a017;"
+                                   onchange="document.getElementById('ntfyStatusBadge').textContent = this.checked ? 'Enabled' : 'Disabled';"
+                                   {% if ntfy_enabled %}checked{% endif %}>
+                            <label class="form-check-label" for="ntfyEnabled">Enable ntfy Notifications</label>
+                        </div>
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label">Server URL</label>
+                        <input type="text" name="ntfy_server_url" class="form-control form-control-sm"
+                               value="{{ ntfy_config.get('server_url', 'https://ntfy.sh') }}" placeholder="https://ntfy.sh">
+                    </div>
+                    <div class="mb-2">
+                        <label class="form-label">Topic</label>
+                        <input type="text" name="ntfy_topic" class="form-control form-control-sm"
+                               value="{{ ntfy_config.get('topic', '') }}" placeholder="mead-tracker-alerts">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Priority</label>
+                        <select name="ntfy_priority" class="form-select form-select-sm">
+                            <option value="low" {% if ntfy_config.get('priority') == 'low' %}selected{% endif %}>Low</option>
+                            <option value="default" {% if not ntfy_config.get('priority') or ntfy_config.get('priority') == 'default' %}selected{% endif %}>Default</option>
+                            <option value="high" {% if ntfy_config.get('priority') == 'high' %}selected{% endif %}>High</option>
+                            <option value="urgent" {% if ntfy_config.get('priority') == 'urgent' %}selected{% endif %}>Urgent</option>
+                        </select>
+                    </div>
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-honey btn-sm">
+                            <i class="bi bi-save"></i> Save
+                        </button>
+                        <button type="submit" formaction="/settings/notifications/test/ntfy"
+                                formmethod="post" class="btn btn-outline-secondary btn-sm">
+                            <i class="bi bi-send"></i> Send Test
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Notifications Log -->
+<div class="card mt-4">
+    <div class="card-header">
+        <i class="bi bi-clock-history"></i> Recent Notifications
+    </div>
+    <div class="card-body p-0">
+        {% if recent_log %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Channel</th>
+                        <th>Event</th>
+                        <th>Subject</th>
+                        <th>Status</th>
+                        <th>Error</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for entry in recent_log %}
+                    <tr>
+                        <td class="small">{{ entry.sent_at }}</td>
+                        <td>
+                            {% if entry.channel == 'email' %}
+                                <i class="bi bi-envelope"></i>
+                            {% elif entry.channel == 'ntfy' %}
+                                <i class="bi bi-phone"></i>
+                            {% else %}
+                                <i class="bi bi-bell"></i>
+                            {% endif %}
+                            {{ entry.channel }}
+                        </td>
+                        <td><span class="badge bg-secondary">{{ entry.event_type }}</span></td>
+                        <td class="small text-muted">{{ entry.subject }}</td>
+                        <td>
+                            {% if entry.status == 'sent' %}
+                                <span class="badge bg-success">Sent</span>
+                            {% else %}
+                                <span class="badge bg-danger">Error</span>
+                            {% endif %}
+                        </td>
+                        <td class="small text-danger">{{ entry.error or '' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">No notifications sent yet.</p>
+        {% endif %}
+    </div>
+</div>
 {% endblock %}
