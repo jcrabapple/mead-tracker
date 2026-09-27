@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="14" fill="#161b22"/>
+<g transform="translate(32 33) scale(0.84) translate(-32 -31)">
+<defs><clipPath id="body"><ellipse cx="32" cy="39" rx="13.5" ry="16"/></clipPath></defs>
+<ellipse cx="18.5" cy="24" rx="10.5" ry="7.5" transform="rotate(-30 18.5 24)" fill="#dce6f2"/>
+<ellipse cx="45.5" cy="24" rx="10.5" ry="7.5" transform="rotate(30 45.5 24)" fill="#dce6f2"/>
+<path d="M28.5 18 Q26 11 21 8.5 M35.5 18 Q38 11 43 8.5" stroke="#f0d060" stroke-width="3.2" fill="none" stroke-linecap="round"/>
+<g clip-path="url(#body)">
+<rect x="17" y="22" width="30" height="36" fill="#d4a017"/>
+<rect x="17" y="35" width="30" height="6" fill="#0d1117"/>
+<rect x="17" y="46.5" width="30" height="6" fill="#0d1117"/>
+</g>
+<circle cx="32" cy="22.5" r="8" fill="#d4a017"/>
+<circle cx="28.8" cy="21.5" r="2.1" fill="#0d1117"/>
+<circle cx="35.2" cy="21.5" r="2.1" fill="#0d1117"/>
+</g>
+</svg>

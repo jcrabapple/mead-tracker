@@ -220,3 +220,14 @@ def test_notification_dedupe_is_per_batch(tmp_path):
     """)
     assert notifications._already_notified_today(db, 1, "gravity_reminder") is True
     assert notifications._already_notified_today(db, 2, "gravity_reminder") is False
+
+
+@pytest.mark.parametrize("path", ["/favicon.ico", "/favicon.svg", "/apple-touch-icon.png",
+                                  "/static/favicon.svg", "/static/icon-192.png", "/manifest.webmanifest"])
+def test_icons_public(client, path):
+    r = client.get(path)
+    assert r.status_code == 200 and len(r.data) > 100
+
+
+def test_other_static_still_private(client):
+    assert client.get("/static/nope.css").status_code == 401

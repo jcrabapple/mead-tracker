@@ -15,7 +15,7 @@ from contextlib import contextmanager
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    jsonify, flash, g, send_file, Response
+    jsonify, flash, g, send_file, send_from_directory, Response
 )
 from werkzeug.utils import secure_filename
 from werkzeug.security import check_password_hash
@@ -57,7 +57,11 @@ AUTH_USER = os.environ.get("MEAD_USER", "")
 AUTH_PASS_HASH = os.environ.get("MEAD_PASSWORD_HASH", "")
 API_TOKEN = os.environ.get("MEAD_API_TOKEN", "")
 AUTH_DISABLED = os.environ.get("MEAD_AUTH_DISABLED") == "1"
-PUBLIC_PATHS = {"/healthz"}
+PUBLIC_PATHS = {
+    "/healthz", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png",
+    "/manifest.webmanifest", "/static/favicon.svg", "/static/favicon.ico",
+    "/static/apple-touch-icon.png", "/static/icon-192.png", "/static/icon-512.png",
+}
 
 
 def _basic_ok(auth):
@@ -103,6 +107,33 @@ def require_auth():
         "Authentication required.", 401,
         {"WWW-Authenticate": 'Basic realm="Mead Tracker", charset="UTF-8"'},
     )
+
+
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+@app.route("/favicon.ico")
+@app.route("/favicon.svg")
+@app.route("/apple-touch-icon.png")
+def root_icons():
+    # Browsers and iOS probe these at the root regardless of <link> tags
+    resp = send_from_directory(STATIC_DIR, request.path.lstrip("/"), max_age=86400)
+    return resp
+
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    resp = jsonify({
+        "name": "Mead Tracker", "short_name": "Mead", "start_url": "/", "display": "standalone",
+        "background_color": "#0d1117", "theme_color": "#161b22",
+        "icons": [
+            {"src": "/static/favicon.svg", "type": "image/svg+xml", "sizes": "any"},
+            {"src": "/static/icon-192.png", "type": "image/png", "sizes": "192x192"},
+            {"src": "/static/icon-512.png", "type": "image/png", "sizes": "512x512"},
+        ],
+    })
+    resp.mimetype = "application/manifest+json"
+    return resp
 
 
 @app.route("/healthz")
