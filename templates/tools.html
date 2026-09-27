@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block title %}Calculators — Mead Tracker{% endblock %}
+
+{% macro field(name, label, step='0.001', placeholder='', help='') %}
+<div class="col-6 col-md-3">
+    <label class="form-label">{{ label }}</label>
+    <input type="number" name="{{ name }}" step="{{ step }}" class="form-control form-control-sm"
+           value="{{ v.get(name, '') }}" placeholder="{{ placeholder }}">
+    {% if help %}<div class="form-text">{{ help }}</div>{% endif %}
+</div>
+{% endmacro %}
+
+{% macro calc_form(calc) %}
+<input type="hidden" name="calc" value="{{ calc }}">
+{% if batch %}<input type="hidden" name="batch" value="{{ batch.id }}">{% endif %}
+{% endmacro %}
+
+{% macro result_box(calc) %}
+{% if errors.get(calc) %}<div class="alert alert-danger py-2 mt-3 mb-0 small">{{ errors[calc] }}</div>{% endif %}
+{% if results.get(calc) %}<div class="calc-result mt-3">{{ caller(results[calc]) }}</div>{% endif %}
+{% endmacro %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <h4 class="mb-0"><i class="bi bi-calculator"></i> Calculators</h4>
+    <form method="get" class="d-flex gap-2 align-items-center">
+        <label class="form-label mb-0">Prefill from</label>
+        <select name="batch" class="form-select form-select-sm" onchange="this.form.submit()" style="width:auto;">
+            <option value="">— no batch —</option>
+            {% for b in batches %}<option value="{{ b.id }}" {% if batch and batch.id == b.id %}selected{% endif %}>{{ b.name }} ({{ b.status }})</option>{% endfor %}
+        </select>
+    </form>
+</div>
+{% if batch %}
+<div class="alert alert-secondary small py-2">
+    Prefilled from <a href="/batch/{{ batch.id }}">{{ batch.name }}</a>: volume {{ '%.2f'|format(defaults.volume_gal) if defaults.volume_gal else '—' }} gal,
+    current SG {{ '%.3f'|format(defaults.current_sg) if defaults.current_sg else '—' }},
+    ABV {{ defaults.abv if defaults.abv is not none else '—' }}%{% if defaults.abv_is_projection %} (projected if it ferments to ~0.998; replace with your real numbers once it's done){% endif %}.
+</div>
+{% endif %}
+
+<div class="row g-3">
+<!-- TOSNA -->
+<div class="col-12 col-lg-6">
+<div class="card h-100" id="tosna">
+    <div class="card-header"><i class="bi bi-eyedropper"></i> Nutrients (TOSNA 2.0)</div>
+    <div class="card-body">
+        <form method="get" action="/tools#tosna" class="row g-2">
+            {{ calc_form('tosna') }}
+            {{ field('og', 'OG', placeholder='1.110') }}
+            {{ field('volume_gal', 'Volume (gal)', step='0.01', placeholder='1.0', help='actual must') }}
+            <div class="col-6 col-md-3">
+                <label class="form-label">Yeast N need</label>
+                <select name="n_level" class="form-select form-select-sm">
+                    {% for lvl in ['low','medium','high'] %}<option value="{{ lvl }}" {% if v.get('n_level', 'medium') == lvl %}selected{% endif %}>{{ lvl }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="col-6 col-md-3 d-flex align-items-end"><button class="btn btn-honey btn-sm w-100">Calculate</button></div>
+        </form>
+        {% call(r) result_box('tosna') %}
+            <div class="row g-2 text-center">
+                <div class="col-4"><div class="calc-big">{{ r.total_g }} g</div><div class="stat-label">Fermaid O total</div></div>
+                <div class="col-4"><div class="calc-big">{{ r.dose_g }} g</div><div class="stat-label">per dose (~{{ r.dose_tsp }} tsp)</div></div>
+                <div class="col-4"><div class="calc-big">{{ '%.3f'|format(r.sugar_break) }}</div><div class="stat-label">1/3 sugar break</div></div>
+            </div>
+            <ol class="small mt-3 mb-2">{% for s in r.schedule %}<li>{{ r.dose_g }} g · {{ s.when }}</li>{% endfor %}</ol>
+            <div class="small text-muted">
+                {{ r.brix }} °Bx, target YAN {{ r.target_yan_ppm }} ppm, {{ r.potential_abv }}% if dry.
+                Rehydrate ~{{ r.yeast_g }} g yeast with {{ r.goferm_g }} g Go-Ferm (in water, not must).
+                Teaspoons assume 2.48 g/tsp level; weigh it if you can.
+            </div>
+        {% endcall %}
+        <div class="form-text mt-2">Formula: Brix × 10 × N factor (0.75 / 0.90 / 1.25) ÷ 50 × gallons. 71B, EC-1118, D47, QA23 are low-N; K1-V1116 medium.</div>
+    </div>
+</div>
+</div>
+
+<!-- Dilution -->
+<div class="col-12 col-lg-6">
+<div class="card h-100" id="dilution">
+    <div class="card-header"><i class="bi bi-droplet-half"></i> Dilution</div>
+    <div class="card-body">
+        <form method="get" action="/tools#dilution" class="row g-2">
+            {{ calc_form('dilution') }}
+            {{ field('volume_gal', 'Volume (gal)', step='0.01', placeholder='0.625') }}
+            {{ field('abv', 'Current ABV %', step='0.1', placeholder='14.4') }}
+            {{ field('target_abv', 'Target ABV %', step='0.1', placeholder='8.9', help='or water below') }}
+            {{ field('water_qt', 'Water to add (qt)', step='0.1', placeholder='1.6', help='optional') }}
+            {{ field('gravity', 'Current SG', placeholder='0.998', help='for SG after') }}
+            <div class="col-6 col-md-3 d-flex align-items-end"><button class="btn btn-honey btn-sm w-100">Calculate</button></div>
+        </form>
+        {% call(r) result_box('dilution') %}
+            <div class="row g-2 text-center">
+                <div class="col-4"><div class="calc-big">{{ r.water_qt }} qt</div><div class="stat-label">water ({{ r.water_cups }} cups)</div></div>
+                <div class="col-4"><div class="calc-big">{{ r.final_abv }}%</div><div class="stat-label">ABV after</div></div>
+                <div class="col-4"><div class="calc-big">{{ '%.2f'|format(r.final_volume_gal) }}</div><div class="stat-label">gal after</div></div>
+            </div>
+            {% if r.gravity_after %}<div class="small text-muted mt-2">SG after mixing ≈ {{ '%.3f'|format(r.gravity_after) }}. Log it as a <em>Dilute</em> event so the batch ABV follows.</div>{% endif %}
+        {% endcall %}
+    </div>
+</div>
+</div>
+
+<!-- Backsweeten -->
+<div class="col-12 col-lg-6">
+<div class="card h-100" id="backsweeten">
+    <div class="card-header"><i class="bi bi-cup-hot"></i> Backsweetening</div>
+    <div class="card-body">
+        <form method="get" action="/tools#backsweeten" class="row g-2">
+            {{ calc_form('backsweeten') }}
+            {{ field('volume_gal', 'Volume (gal)', step='0.01', placeholder='1.0') }}
+            {{ field('current_sg', 'Current SG', placeholder='0.998') }}
+            {{ field('target_sg', 'Target SG', placeholder='1.013') }}
+            <div class="col-6 col-md-3">
+                <label class="form-label">Sweetener</label>
+                <select name="sweetener" class="form-select form-select-sm">
+                    {% for k, s in SWEETENERS.items() %}<option value="{{ k }}" {% if v.get('sweetener', 'honey') == k %}selected{% endif %}>{{ s.label }}</option>{% endfor %}
+                </select>
+            </div>
+            {{ field('abv', 'ABV % (optional)', step='0.1', placeholder='8.9') }}
+            <div class="col-6 col-md-3 d-flex align-items-end"><button class="btn btn-honey btn-sm w-100">Calculate</button></div>
+        </form>
+        {% call(r) result_box('backsweeten') %}
+            <div class="row g-2 text-center">
+                <div class="col-4"><div class="calc-big">{{ r.oz_weight }} oz</div><div class="stat-label">{{ r.label|lower }} by weight ({{ r.grams }} g)</div></div>
+                <div class="col-4"><div class="calc-big">{{ r.fl_oz }} fl oz</div><div class="stat-label">by volume</div></div>
+                <div class="col-4"><div class="calc-big">{{ r.final_abv if r.final_abv else '—' }}{% if r.final_abv %}%{% endif %}</div><div class="stat-label">ABV after</div></div>
+            </div>
+            <div class="small text-muted mt-2">
+                Add it in two or three steps and re-read; each 2 oz raises a gallon ~{{ r.points_per_2oz_per_gal }} points.
+                Stabilize first (k-meta + sorbate, 48 h) unless you want it to referment.
+            </div>
+        {% endcall %}
+    </div>
+</div>
+</div>
+
+<!-- Honey for OG -->
+<div class="col-12 col-lg-6">
+<div class="card h-100" id="honey">
+    <div class="card-header"><i class="bi bi-hexagon"></i> Honey for a Target OG</div>
+    <div class="card-body">
+        <form method="get" action="/tools#honey" class="row g-2">
+            {{ calc_form('honey') }}
+            {{ field('volume_gal', 'Final volume (gal)', step='0.01', placeholder='1.0') }}
+            {{ field('target_og', 'Target OG', placeholder='1.100') }}
+            <div class="col-6 col-md-3">
+                <label class="form-label">Sugar</label>
+                <select name="sweetener" class="form-select form-select-sm">
+                    {% for k, s in SWEETENERS.items() %}<option value="{{ k }}" {% if v.get('sweetener', 'honey') == k %}selected{% endif %}>{{ s.label }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="col-6 col-md-3 d-flex align-items-end"><button class="btn btn-honey btn-sm w-100">Calculate</button></div>
+        </form>
+        {% call(r) result_box('honey') %}
+            <div class="row g-2 text-center">
+                <div class="col-4"><div class="calc-big">{{ r.lb }} lb</div><div class="stat-label">{{ r.oz_weight }} oz</div></div>
+                <div class="col-4"><div class="calc-big">{{ r.water_qt }} qt</div><div class="stat-label">water, approx.</div></div>
+                <div class="col-4"><div class="calc-big">{{ r.potential_abv }}%</div><div class="stat-label">if dry ({{ r.brix }} °Bx)</div></div>
+            </div>
+            <div class="small text-muted mt-2">Honey sugar content varies; mix to ~90% of the water, read, then top up. Fruit adds sugar and volume this doesn't count.</div>
+        {% endcall %}
+    </div>
+</div>
+</div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+{% if which %}<script>document.getElementById('{{ which }}')?.scrollIntoView({block: 'start'});</script>{% endif %}
+{% endblock %}

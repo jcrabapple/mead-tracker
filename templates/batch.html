@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_actions.html" import action_list %}
 {% block title %}{{ batch.name }} — Mead Tracker{% endblock %}
 
 {% block content %}
@@ -108,6 +109,66 @@
     </div>
 </div>
 {% endif %}
+
+<!-- Next actions -->
+<div class="card mb-4" id="actions">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span><i class="bi bi-list-check"></i> Next Up</span>
+        <div class="d-flex gap-2">
+            <a href="/tools?batch={{ batch.id }}" class="btn btn-outline-secondary btn-sm"><i class="bi bi-calculator"></i> Calculators</a>
+            {% if tosna and batch.status in ('planning', 'active') %}
+            <form method="post" action="/batch/{{ batch.id }}/tosna" class="d-flex gap-1"
+                  onsubmit="return confirm('Add TOSNA dose tasks: {{ tosna.total_g }} g Fermaid O total, {{ tosna.dose_g }} g (~{{ tosna.dose_tsp }} tsp) x 4?')">
+                <select name="n_level" class="form-select form-select-sm" style="width:auto;" title="Yeast nitrogen demand">
+                    {% for lvl in ['low','medium','high'] %}<option value="{{ lvl }}" {% if lvl == tosna.n_level %}selected{% endif %}>{{ lvl }} N</option>{% endfor %}
+                </select>
+                <button class="btn btn-outline-secondary btn-sm"><i class="bi bi-eyedropper"></i> TOSNA tasks</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+    {% if actions %}
+        {{ action_list(actions, show_batch=False, next_url='/batch/' ~ batch.id ~ '#actions') }}
+    {% else %}
+        <div class="card-body text-muted small py-2">Nothing pending for this batch.</div>
+    {% endif %}
+    {% if done_tasks %}
+    <details class="px-3 py-2 small">
+        <summary class="text-muted">Recently done ({{ done_tasks|length }})</summary>
+        {% for t in done_tasks %}
+        <div class="d-flex justify-content-between align-items-center py-1">
+            <span class="text-muted"><s>{{ t.title }}</s> · {{ t.done_at[:10] }}</span>
+            <form method="post" action="/task/{{ t.id }}/undo"><button class="btn btn-link btn-sm p-0">undo</button></form>
+        </div>
+        {% endfor %}
+    </details>
+    {% endif %}
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/task" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Due</label>
+                <input type="date" name="due_date" class="form-control form-control-sm">
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Kind</label>
+                <select name="kind" class="form-select form-select-sm">
+                    {% for k, v in TASK_KINDS.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">Task</label>
+                <input type="text" name="title" class="form-control form-control-sm" placeholder="Strain pumpkin + dilute" required>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label">Details</label>
+                <input type="text" name="details" class="form-control form-control-sm" placeholder="1.6 qt water">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-honey btn-sm w-100"><i class="bi bi-plus"></i> Add Task</button>
+            </div>
+        </form>
+    </div>
+</div>
 
 <!-- Gravity Chart -->
 {% if readings|length > 1 %}
@@ -281,9 +342,14 @@
                     </select>
                 </div>
             </div>
-            <div class="col-6 col-md-1 ev-sugar">
-                <label class="form-label">Sugar oz</label>
-                <input type="number" name="sugar_oz" step="0.1" min="0" class="form-control form-control-sm" placeholder="6">
+            <div class="col-6 col-md-2 ev-sugar">
+                <label class="form-label">Sugar (oz wt)</label>
+                <div class="input-group input-group-sm">
+                    <input type="number" name="sugar_oz" step="0.1" min="0" class="form-control" placeholder="6">
+                    <select name="sweetener" class="form-select" style="max-width:6.5rem;">
+                        {% for k, s in SWEETENERS.items() %}<option value="{{ k }}">{{ s.label }}</option>{% endfor %}
+                    </select>
+                </div>
             </div>
             <div class="col-4 col-md-1">
                 <label class="form-label">SG Before</label>
@@ -297,15 +363,104 @@
                 <label class="form-label">Vol After</label>
                 <input type="number" name="volume_after_gal" step="0.01" min="0" class="form-control form-control-sm" placeholder="gal">
             </div>
-            <div class="col-md-2">
-                <label class="form-label">Amount / Notes</label>
-                <input type="text" name="notes" class="form-control form-control-sm" placeholder="1/4 tsp k-meta…">
+            <div class="col-md-1">
+                <label class="form-label">Notes</label>
+                <input type="text" name="notes" class="form-control form-control-sm" placeholder="k-meta…">
             </div>
             <div class="col-12 col-md-12 d-flex justify-content-between align-items-center">
                 <small class="text-muted">Dilute: liquid added. Backsweeten: sugar oz (+ SG after if measured). Rack: volume after. Leave SG before blank to use the last reading.</small>
                 <button type="submit" class="btn btn-honey btn-sm"><i class="bi bi-plus"></i> Log Event</button>
             </div>
         </form>
+    </div>
+</div>
+
+<!-- Bottles -->
+<div class="card mb-4" id="bottles">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-cup"></i> Bottles</span>
+        {% if bottle_inv.filled %}<small class="text-muted">{{ bottle_inv.remaining }} of {{ bottle_inv.filled }} left · {{ '%.2f'|format(bottle_inv.remaining_ml / 1000) }} L</small>{% endif %}
+    </div>
+    <div class="card-body p-0">
+        {% if bottlings %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0 align-middle">
+                <thead><tr><th>Bottled</th><th>Size</th><th>Left</th><th>Closure</th><th>Location</th><th>Log one</th><th></th></tr></thead>
+                <tbody>
+                {% for bt in bottlings %}
+                <tr>
+                    <td>{{ bt.bottle_date }}{% if bt.age_days is not none %} <span class="text-muted small">({{ bt.age_days }}d)</span>{% endif %}</td>
+                    <td>{{ bt.size_ml }} ml</td>
+                    <td><strong>{{ bt.remaining }}</strong> / {{ bt.count }}</td>
+                    <td class="small">{{ bt.closure }}</td>
+                    <td class="small">{{ bt.location }}</td>
+                    <td>
+                        {% if bt.remaining > 0 %}
+                        <form method="post" action="/bottling/{{ bt.id }}/use" class="d-flex gap-1">
+                            <input type="hidden" name="next" value="/batch/{{ batch.id }}#bottles">
+                            <select name="reason" class="form-select form-select-sm" style="width:auto;">
+                                {% for rsn in BOTTLE_REASONS %}<option value="{{ rsn }}">{{ rsn }}</option>{% endfor %}
+                            </select>
+                            <button class="btn btn-sm btn-honey py-0" title="Take one bottle out of inventory">−1</button>
+                        </form>
+                        {% else %}<span class="text-muted small">empty</span>{% endif %}
+                    </td>
+                    <td>
+                        <form method="post" action="/bottling/{{ bt.id }}/delete" onsubmit="return confirm('Remove this bottling and its log?')">
+                            <button class="btn btn-link btn-sm text-danger p-0"><i class="bi bi-x"></i></button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% if bottle_log %}
+        <details class="px-3 py-2 small">
+            <summary class="text-muted">Bottle log ({{ bottle_log|length }})</summary>
+            {% for l in bottle_log %}
+            <div class="d-flex justify-content-between py-1">
+                <span>{{ l.log_date }} · {{ l.qty }} × {{ l.size_ml }} ml · {{ l.reason }}{% if l.notes %} · <span class="text-muted">{{ l.notes }}</span>{% endif %}</span>
+                <form method="post" action="/bottlelog/{{ l.id }}/delete"><input type="hidden" name="next" value="/batch/{{ batch.id }}#bottles">
+                    <button class="btn btn-link btn-sm p-0" title="Undo">undo</button></form>
+            </div>
+            {% endfor %}
+        </details>
+        {% endif %}
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">Not bottled yet.</p>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/bottling" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Date</label>
+                <input type="date" name="bottle_date" class="form-control form-control-sm" value="{{ today }}">
+            </div>
+            <div class="col-3 col-md-1">
+                <label class="form-label">Count</label>
+                <input type="number" name="count" min="1" class="form-control form-control-sm" placeholder="5" required>
+            </div>
+            <div class="col-3 col-md-2">
+                <label class="form-label">Size</label>
+                <select name="size_ml" class="form-select form-select-sm">
+                    <option value="750">750 ml</option><option value="375">375 ml</option><option value="500">500 ml</option>
+                    <option value="330">330 ml</option><option value="187">187 ml</option><option value="1000">1 L</option>
+                </select>
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Closure</label>
+                <input type="text" name="closure" class="form-control form-control-sm" placeholder="cork, swing-top">
+            </div>
+            <div class="col-6 col-md-3">
+                <label class="form-label">Location</label>
+                <input type="text" name="location" class="form-control form-control-sm" placeholder="basement rack">
+            </div>
+            <div class="col-md-2">
+                <button type="submit" class="btn btn-honey btn-sm w-100"><i class="bi bi-plus"></i> Add Bottles</button>
+            </div>
+        </form>
+        <small class="text-muted">Adding the first bottles sets the bottled date and moves the batch to <em>bottled</em>; logging the first one out moves it to <em>drinking</em>.</small>
     </div>
 </div>
 

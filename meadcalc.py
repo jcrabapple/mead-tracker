@@ -22,7 +22,27 @@ from dataclasses import dataclass, field, asdict
 
 ABV_FACTOR = 131.25
 HONEY_PPG = 35.0            # gravity points per lb per gallon
-HONEY_GAL_PER_LB = 0.0857   # volume 1 lb of honey adds (~12 lb/gal)
+HONEY_GAL_PER_LB = 0.0857   # volume 1 lb of honey adds (~11.7 lb/gal)
+
+# Sweeteners: gravity points per lb per gallon, gallons of volume per lb.
+# Maple is ~66% sugar vs honey ~82%; syrup density ~1.32 (11 lb/gal).
+SWEETENERS = {
+    "honey": {"label": "Honey", "ppg": 35.0, "gal_per_lb": HONEY_GAL_PER_LB},
+    "maple": {"label": "Maple syrup", "ppg": 30.0, "gal_per_lb": 1 / 11.0},
+    "sucrose": {"label": "Table sugar", "ppg": 46.0, "gal_per_lb": 0.0755},
+    "dextrose": {"label": "Corn sugar (dextrose)", "ppg": 42.0, "gal_per_lb": 0.077},
+}
+FL_OZ_PER_GAL = 128.0
+FERMAID_O_G_PER_TSP = 2.48  # level tsp, meadmaking.wiki conversion table
+
+# TOSNA 2.0 nitrogen factors and per-strain demand (Lallemand datasheets).
+N_FACTORS = {"low": 0.75, "medium": 0.90, "high": 1.25}
+YEAST_N = [
+    ("71b", "low"), ("ec-1118", "low"), ("ec1118", "low"), ("d47", "low"),
+    ("qa23", "low"), ("k1", "medium"), ("d254", "medium"), ("m05", "medium"),
+    ("premier blanc", "low"), ("dv10", "low"), ("bm45", "high"), ("bm 4x4", "high"),
+    ("rc212", "medium"), ("cy3079", "high"),
+]
 
 EVENT_TYPES = {
     # type: (label, affects_math)
@@ -41,6 +61,132 @@ EVENT_TYPES = {
     "fining": ("Fining / clarifier", False),
     "note": ("Note", False),
 }
+
+
+def yeast_n_level(strain: str | None) -> str:
+    s = (strain or "").lower()
+    for key, level in YEAST_N:
+        if key in s:
+            return level
+    return "medium"
+
+
+def brix(sg: float) -> float:
+    """Specific gravity to degrees Brix (standard cubic fit)."""
+    return ((182.4601 * sg - 775.6821) * sg + 1262.7794) * sg - 669.5622
+
+
+def sugar_break(og: float, fraction: float = 1 / 3) -> float:
+    """Gravity at which `fraction` of the sugar has fermented (TOSNA 1/3 break)."""
+    return round(og - (og - 1.0) * fraction, 3)
+
+
+def calc_tosna(og: float, volume_gal: float, n_level: str = "medium",
+               g_per_tsp: float = FERMAID_O_G_PER_TSP) -> dict:
+    """TOSNA 2.0: total Fermaid O (g) = Brix * 10 * N / 50 * gallons, in 4 doses
+    at 24 h, 48 h, 72 h and the 1/3 sugar break. Go-Ferm at rehydration."""
+    if n_level not in N_FACTORS:
+        raise ValueError("n_level must be low, medium, or high")
+    if not (1.0 < og < 1.250) or volume_gal <= 0:
+        raise ValueError("need OG between 1.000 and 1.250 and a positive volume")
+    bx = brix(og)
+    target_yan = bx * 10 * N_FACTORS[n_level]          # ppm
+    total_g = target_yan / 50 * volume_gal
+    dose_g = total_g / 4
+    yeast_g = max(1.0, 2.0 * volume_gal)               # ~2 g dry yeast per gallon
+    return {
+        "brix": round(bx, 1),
+        "n_level": n_level,
+        "target_yan_ppm": round(target_yan),
+        "total_g": round(total_g, 2),
+        "total_tsp": round(total_g / g_per_tsp, 2),
+        "dose_g": round(dose_g, 2),
+        "dose_tsp": round(dose_g / g_per_tsp, 2),
+        "sugar_break": sugar_break(og),
+        "potential_abv": round((og - 0.996) * ABV_FACTOR, 1),
+        "yeast_g": round(yeast_g, 1),
+        "goferm_g": round(yeast_g * 1.25, 1),
+        "schedule": [
+            {"when": "24 hours after pitch", "day": 1},
+            {"when": "48 hours after pitch", "day": 2},
+            {"when": "72 hours after pitch", "day": 3},
+            {"when": f"1/3 sugar break (SG {sugar_break(og):.3f}) or day 7, whichever first", "day": 7},
+        ],
+    }
+
+
+def calc_dilution(volume_gal: float, abv: float, target_abv: float | None = None,
+                  water_gal: float | None = None, gravity: float | None = None) -> dict:
+    """Water needed to reach a target ABV, or the ABV after adding water."""
+    if volume_gal <= 0 or abv <= 0:
+        raise ValueError("need a positive volume and ABV")
+    if water_gal is None:
+        if target_abv is None or not (0 < target_abv < abv):
+            raise ValueError("target ABV must be above 0 and below the current ABV")
+        water_gal = volume_gal * (abv / target_abv - 1)
+    v2 = volume_gal + water_gal
+    out = {
+        "water_gal": round(water_gal, 3),
+        "water_qt": round(water_gal * 4, 2),
+        "water_cups": round(water_gal * 16, 1),
+        "final_volume_gal": round(v2, 3),
+        "final_abv": round(abv * volume_gal / v2, 2),
+        "gravity_after": None,
+    }
+    if gravity is not None:
+        out["gravity_after"] = round(1 + (gravity - 1) * volume_gal / v2, 4)
+    return out
+
+
+def calc_backsweeten(volume_gal: float, current_sg: float, target_sg: float,
+                     sweetener: str = "honey", abv: float | None = None) -> dict:
+    """Sweetener needed to raise a batch from current_sg to target_sg.
+
+    Accounts for the volume the sweetener itself adds (which dilutes the
+    points it contributes and the alcohol already present)."""
+    sw = SWEETENERS.get(sweetener)
+    if not sw:
+        raise ValueError(f"sweetener must be one of {', '.join(SWEETENERS)}")
+    if volume_gal <= 0 or target_sg <= current_sg:
+        raise ValueError("target gravity must be above the current gravity")
+    pn = (current_sg - 1) * 1000
+    pt = (target_sg - 1) * 1000
+    denom = sw["ppg"] - pt * sw["gal_per_lb"]
+    if denom <= 0:
+        raise ValueError("target gravity is higher than this sweetener can reach")
+    lb = volume_gal * (pt - pn) / denom
+    added_gal = lb * sw["gal_per_lb"]
+    v2 = volume_gal + added_gal
+    return {
+        "sweetener": sweetener,
+        "label": sw["label"],
+        "lb": round(lb, 3),
+        "oz_weight": round(lb * 16, 1),
+        "grams": round(lb * 453.6),
+        "fl_oz": round(added_gal * FL_OZ_PER_GAL, 1),
+        "points_per_2oz_per_gal": round(sw["ppg"] / 8, 1),
+        "final_volume_gal": round(v2, 3),
+        "final_abv": round(abv * volume_gal / v2, 2) if abv else None,
+    }
+
+
+def calc_honey_for_og(volume_gal: float, target_og: float, sweetener: str = "honey") -> dict:
+    """Honey (or other sugar) for a target OG at a final must volume."""
+    sw = SWEETENERS.get(sweetener)
+    if not sw:
+        raise ValueError(f"sweetener must be one of {', '.join(SWEETENERS)}")
+    if volume_gal <= 0 or not (1.0 < target_og < 1.250):
+        raise ValueError("need a positive volume and OG between 1.000 and 1.250")
+    lb = (target_og - 1) * 1000 * volume_gal / sw["ppg"]
+    water_gal = volume_gal - lb * sw["gal_per_lb"]
+    return {
+        "lb": round(lb, 2),
+        "oz_weight": round(lb * 16, 1),
+        "water_gal": round(water_gal, 3),
+        "water_qt": round(water_gal * 4, 2),
+        "potential_abv": round((target_og - 0.996) * ABV_FACTOR, 1),
+        "brix": round(brix(target_og), 1),
+    }
 
 
 def event_label(event_type: str) -> str:
@@ -140,8 +286,9 @@ def compute(batch: dict, readings: list[dict], events: list[dict]) -> dict:
             st.stabilized = True
             st.stabilized_date = row.get("event_date")
 
+        sw = SWEETENERS.get(row.get("sweetener") or "honey", SWEETENERS["honey"])
         if sugar_lb and not added:
-            added = round(sugar_lb * HONEY_GAL_PER_LB, 4)
+            added = round(sugar_lb * sw["gal_per_lb"], 4)
 
         if added > 0 and v1:
             # Addition: dilutes existing alcohol, starts a new segment
@@ -149,7 +296,7 @@ def compute(batch: dict, readings: list[dict], events: list[dict]) -> dict:
             if g_after_measured is not None:
                 g_after = g_after_measured
             elif g_before is not None:
-                gu = (g_before - 1.0) * 1000.0 * v1 + sugar_lb * HONEY_PPG
+                gu = (g_before - 1.0) * 1000.0 * v1 + sugar_lb * sw["ppg"]
                 g_after = round(1.0 + gu / (1000.0 * v2), 4)
                 out["estimated_gravity"] = True
             else:

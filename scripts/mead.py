@@ -10,6 +10,13 @@
                 [--sg-before G] [--sg-after G] [--vol-after GAL] [--date ...] [--notes ...]
   mead.py tasting <id> [--rating N] [--aroma ...] [--flavor ...] [--notes ...]
   mead.py set <id> field=value [field=value ...]
+  mead.py todo [--batch ID] [--days N]            next actions (tasks + auto rules)
+  mead.py task <id|0> "<title>" [--due YYYY-MM-DD] [--kind nutrient|reading|process|check|other] [--details ...]
+  mead.py done <task_id>
+  mead.py calc <tosna|dilution|backsweeten|honey> key=value ... [batch_id=N]
+  mead.py bottle <id> <count> [--size 750] [--closure ...] [--location ...] [--date ...]
+  mead.py drink <bottling_id> [--qty 1] [--reason drank|gifted|shared|competition|broken|other]
+  mead.py cellar
 
 MEAD_URL overrides the base URL (default http://127.0.0.1:8789).
 """
@@ -67,6 +74,17 @@ def main():
     for f in ("--aroma", "--flavor", "--body", "--sweetness", "--notes", "--date"):
         s.add_argument(f)
     s = sub.add_parser("set"); s.add_argument("id", type=int); s.add_argument("pairs", nargs="+")
+    s = sub.add_parser("todo"); s.add_argument("--batch", type=int); s.add_argument("--days", type=int, default=14)
+    s = sub.add_parser("task"); s.add_argument("id", type=int); s.add_argument("title")
+    s.add_argument("--due"); s.add_argument("--kind", default="other"); s.add_argument("--details", default="")
+    s = sub.add_parser("done"); s.add_argument("task_id", type=int)
+    s = sub.add_parser("calc"); s.add_argument("name"); s.add_argument("pairs", nargs="*")
+    s = sub.add_parser("bottle"); s.add_argument("id", type=int); s.add_argument("count", type=int)
+    s.add_argument("--size", type=int, default=750); s.add_argument("--closure", default="")
+    s.add_argument("--location", default=""); s.add_argument("--date"); s.add_argument("--notes", default="")
+    s = sub.add_parser("drink"); s.add_argument("bottling_id", type=int); s.add_argument("--qty", type=int, default=1)
+    s.add_argument("--reason", default="drank"); s.add_argument("--date"); s.add_argument("--notes", default="")
+    sub.add_parser("cellar")
     a = p.parse_args()
 
     if a.cmd == "batches":
@@ -94,6 +112,24 @@ def main():
     elif a.cmd == "set":
         body = dict(pair.split("=", 1) for pair in a.pairs)
         out = call("PATCH", f"/batch/{a.id}", body)
+    elif a.cmd == "todo":
+        q = f"?days={a.days}" + (f"&batch_id={a.batch}" if a.batch else "")
+        out = call("GET", "/actions" + q)
+    elif a.cmd == "task":
+        out = call("POST", "/tasks", {"batch_id": a.id or None, "title": a.title, "due_date": a.due,
+                                      "kind": a.kind, "details": a.details})
+    elif a.cmd == "done":
+        out = call("PATCH", f"/task/{a.task_id}", {"done": True})
+    elif a.cmd == "calc":
+        out = call("POST", f"/calc/{a.name}", dict(pair.split("=", 1) for pair in a.pairs))
+    elif a.cmd == "bottle":
+        out = call("POST", f"/batch/{a.id}/bottlings", {"count": a.count, "size_ml": a.size, "closure": a.closure,
+                                                        "location": a.location, "date": a.date, "notes": a.notes})
+    elif a.cmd == "drink":
+        out = call("POST", f"/bottling/{a.bottling_id}/use", {"qty": a.qty, "reason": a.reason,
+                                                               "date": a.date, "notes": a.notes})
+    elif a.cmd == "cellar":
+        out = call("GET", "/inventory")
     print(json.dumps(out, indent=2))
 
 

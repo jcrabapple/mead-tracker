@@ -1,0 +1,28 @@
+{% macro action_list(actions, show_batch=True, next_url='/') %}
+{% set sev_cls = {'overdue':'danger','today':'warning','warning':'warning','soon':'info','info':'secondary'} %}
+{% set sev_icon = {'overdue':'exclamation-octagon','today':'alarm','warning':'exclamation-triangle','soon':'clock','info':'info-circle'} %}
+<ul class="list-group list-group-flush action-list">
+{% for a in actions %}
+  <li class="list-group-item d-flex gap-2 align-items-start action-{{ a.severity }}">
+    <i class="bi bi-{{ sev_icon.get(a.severity, 'dot') }} text-{{ sev_cls.get(a.severity, 'secondary') }} mt-1"></i>
+    <div class="flex-grow-1">
+      <div>
+        {% if show_batch and a.batch_id %}<a href="/batch/{{ a.batch_id }}" class="fw-semibold">{{ a.batch_name }}</a> · {% endif %}
+        <span>{{ a.title }}</span>
+        {% if a.due_rel %}<span class="badge bg-{{ sev_cls.get(a.severity, 'secondary') }} {% if a.severity in ('today','warning') %}text-dark{% endif %} ms-1">{{ a.due_rel }}</span>{% endif %}
+        {% if a.source == 'rule' %}<span class="text-muted small ms-1" title="Derived from batch data; resolves itself when the data changes">auto</span>{% endif %}
+      </div>
+      {% if a.detail %}<div class="text-muted small">{{ a.detail }}</div>{% endif %}
+    </div>
+    {% if a.source == 'task' %}
+    <div class="d-flex gap-1">
+      <form method="post" action="/task/{{ a.task_id }}/done"><input type="hidden" name="next" value="{{ next_url }}">
+        <button class="btn btn-sm btn-outline-success py-0" title="Done"><i class="bi bi-check-lg"></i></button></form>
+      <form method="post" action="/task/{{ a.task_id }}/snooze"><input type="hidden" name="next" value="{{ next_url }}">
+        <button class="btn btn-sm btn-outline-secondary py-0" title="Snooze 1 day"><i class="bi bi-alarm"></i></button></form>
+    </div>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+{% endmacro %}

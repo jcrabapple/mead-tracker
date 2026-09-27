@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Cellar — Mead Tracker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h4 class="mb-0"><i class="bi bi-cup"></i> Cellar</h4>
+</div>
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-md-3"><div class="card stat-card"><div class="stat-value">{{ inv.total_bottles }}</div><div class="stat-label">Bottles on Hand</div></div></div>
+    <div class="col-6 col-md-3"><div class="card stat-card"><div class="stat-value">{{ inv.total_liters }}</div><div class="stat-label">Liters</div></div></div>
+    <div class="col-6 col-md-3"><div class="card stat-card"><div class="stat-value">{{ inv.rows|map(attribute='batch_id')|unique|list|length }}</div><div class="stat-label">Batches</div></div></div>
+    <div class="col-6 col-md-3"><div class="card stat-card"><div class="stat-value">{{ inv.recent|selectattr('reason', 'equalto', 'drank')|map(attribute='qty')|sum }}</div><div class="stat-label">Recently Drunk</div></div></div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-box-seam"></i> In Stock</div>
+    <div class="card-body p-0">
+    {% if inv.rows %}
+        <div class="table-responsive">
+        <table class="table table-hover mb-0 align-middle">
+            <thead><tr><th>Batch</th><th>Bottled</th><th>Age</th><th>Size</th><th>Left</th><th>ABV</th><th>Location</th><th></th></tr></thead>
+            <tbody>
+            {% for r in inv.rows %}
+            <tr>
+                <td><a href="/batch/{{ r.batch_id }}#bottles">{{ r.batch_name }}</a></td>
+                <td>{{ r.bottle_date }}</td>
+                <td class="small">{% if r.age_days is not none %}{% if r.age_days >= 60 %}{{ (r.age_days / 30.4)|round|int }} mo{% else %}{{ r.age_days }} d{% endif %}{% endif %}</td>
+                <td>{{ r.size_ml }} ml</td>
+                <td><strong>{{ r.remaining }}</strong> / {{ r.count }}</td>
+                <td>{{ '~%.1f%%'|format(r.abv) if r.abv else '—' }}</td>
+                <td class="small">{{ r.location }}</td>
+                <td>
+                    <form method="post" action="/bottling/{{ r.id }}/use" class="d-flex gap-1">
+                        <input type="hidden" name="next" value="/inventory">
+                        <select name="reason" class="form-select form-select-sm" style="width:auto;">
+                            {% for rsn in BOTTLE_REASONS %}<option value="{{ rsn }}">{{ rsn }}</option>{% endfor %}
+                        </select>
+                        <button class="btn btn-sm btn-honey py-0">−1</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+    {% else %}
+        <p class="text-muted text-center py-4 mb-0">Nothing in the cellar. Add bottles from a batch page when you bottle.</p>
+    {% endif %}
+    </div>
+</div>
+
+{% if inv.recent %}
+<div class="card">
+    <div class="card-header"><i class="bi bi-clock-history"></i> Recent</div>
+    <ul class="list-group list-group-flush">
+    {% for l in inv.recent %}
+        <li class="list-group-item d-flex justify-content-between small">
+            <span>{{ l.log_date }} · <a href="/batch/{{ l.batch_id }}">{{ l.batch_name }}</a> · {{ l.qty }} × {{ l.size_ml }} ml · {{ l.reason }}{% if l.notes %} · <span class="text-muted">{{ l.notes }}</span>{% endif %}</span>
+            <form method="post" action="/bottlelog/{{ l.id }}/delete"><input type="hidden" name="next" value="/inventory">
+                <button class="btn btn-link btn-sm p-0">undo</button></form>
+        </li>
+    {% endfor %}
+    </ul>
+</div>
+{% endif %}
+{% endblock %}

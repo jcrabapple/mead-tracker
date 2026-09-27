@@ -130,6 +130,8 @@ def _check_notifications_internal(db):
     if not settings_rows:
         return  # no channels configured
 
+    _send_due_tasks(db, settings_rows)
+
     # Load enabled notification rules
     rules = db.execute(
         "SELECT * FROM notification_rules WHERE enabled = 1"
@@ -291,6 +293,36 @@ def _check_notifications_internal(db):
                                            "aging_milestone", subject, body)
                     _update_last_notified(db, rule["id"])
                     break  # only send once per aging milestone
+
+
+def _send_due_tasks(db, settings_rows, now=None):
+    """Send each open task once, on or after its due date, from 8am local.
+
+    notified_at makes it idempotent across hourly runs; snoozing or changing
+    the due date clears it so the task fires again."""
+    now = now or datetime.now()
+    if now.hour < 8:
+        return 0
+    try:
+        tasks = db.execute(
+            """SELECT t.*, b.name AS batch_name FROM tasks t
+               LEFT JOIN batches b ON b.id = t.batch_id
+               WHERE t.done_at IS NULL AND t.notified_at IS NULL
+                 AND t.due_date IS NOT NULL AND t.due_date <= ?""",
+            (now.date().isoformat(),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0  # tasks table not created yet
+    sent = 0
+    for t in tasks:
+        name = t["batch_name"] or "Mead Tracker"
+        subject = f"🍯 {name}: {t['title']}"
+        body = f"{t['title']}\n\n{t['details'] or ''}\n\nDue {t['due_date']}. Mark it done in the tracker."
+        _send_via_all_channels(db, settings_rows, t["batch_id"], "task_due", subject, body)
+        db.execute("UPDATE tasks SET notified_at = datetime('now') WHERE id = ?", (t["id"],))
+        db.commit()
+        sent += 1
+    return sent
 
 
 def _already_notified_today(db, rule_id, event_type):

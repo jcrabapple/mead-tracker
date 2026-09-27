@@ -44,6 +44,11 @@
             .stat-card .stat-value { font-size: 1.3rem; }
             .table { font-size: 0.85rem; }
         }
+        .calc-big { font-size: 1.35rem; font-weight: 700; color: #f0b429; }
+        .calc-result { border-top: 1px solid #30363d; padding-top: .75rem; }
+        .action-list .list-group-item { background: transparent; }
+        .action-overdue { border-left: 3px solid #f85149 !important; }
+        .action-today, .action-warning { border-left: 3px solid #f0b429 !important; }
     </style>
     {% block extra_head %}{% endblock %}
 </head>
@@ -54,6 +59,8 @@
                 <i class="bi bi-droplet-fill"></i> Mead Tracker
             </a>
             <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="/inventory"><i class="bi bi-cup"></i> Cellar</a>
+                <a class="nav-link" href="/tools"><i class="bi bi-calculator"></i> Calculators</a>
                 <a class="nav-link" href="/recipe/generate"><i class="bi bi-stars"></i> AI Recipe</a>
                 <a class="nav-link" href="/batch/new"><i class="bi bi-plus-circle"></i> New Batch</a>
                 <a class="nav-link" href="/settings"><i class="bi bi-gear"></i> Settings</a>

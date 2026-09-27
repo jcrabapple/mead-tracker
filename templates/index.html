@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_actions.html" import action_list %}
 {% block title %}Mead Tracker — Dashboard{% endblock %}
 
 {% block content %}
@@ -31,11 +32,26 @@
         </div>
     </div>
     <div class="col-6 col-md-3">
+        <a href="/inventory" class="text-decoration-none">
         <div class="card stat-card">
-            <div class="stat-value">{{ batches|length }}</div>
-            <div class="stat-label">Total</div>
+            <div class="stat-value">{{ inv.remaining }}</div>
+            <div class="stat-label">Bottles on Hand</div>
         </div>
+        </a>
     </div>
+</div>
+
+<!-- Next actions -->
+<div class="card mb-4" id="next-actions">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-list-check"></i> Next Up</span>
+        <small class="text-muted">next 14 days</small>
+    </div>
+    {% if actions %}
+        {{ action_list(actions, show_batch=True, next_url='/') }}
+    {% else %}
+        <div class="card-body text-muted small">Nothing due. The carboys are handling it.</div>
+    {% endif %}
 </div>
 
 <!-- Batch cards -->

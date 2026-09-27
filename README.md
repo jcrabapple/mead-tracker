@@ -21,6 +21,9 @@ Built with Flask and SQLite. Dark-themed, mobile-friendly, zero dependencies bey
 - **Process events** — log dilution, backsweetening, step-feeds, racking, stabilizing, spicing, and more. ABV and volume are recomputed across every volume/sugar change, so a diluted or backsweetened batch reports its real strength instead of `(OG − G) × 131.25`
 - **Authentication** — HTTP Basic auth for the UI, bearer token for the API, same-origin check on form POSTs
 - **Read/write REST API** — create batches, log readings, nutrients, tastings, ingredients, and process events; every write returns the batch's recomputed state
+- **Next Up panel** — dated tasks (nutrient doses, "strain fruit by day 14") plus automatic rules derived from batch data: reading gaps, 1/3 sugar break, stable gravity, fruit contact time, backsweetened-but-not-stabilized, ready to backsweeten, bottling bookkeeping. Due tasks go out once through the configured notification channels
+- **Calculators** — TOSNA 2.0 nutrients (with one-click dose tasks), dilution to a target ABV, backsweetening (honey, maple, sugar, dextrose; accounts for the sweetener's own volume), honey for a target OG. Any calculator can prefill from a batch
+- **Cellar** — bottle inventory per bottling run (size, closure, location, age); log bottles drunk/gifted/shared with undo. Bottling moves a batch to *bottled*, the first bottle out moves it to *drinking*
 - **Dark UI** — Honey-themed dark mode with Bootstrap 5, fully responsive
 
 ## Screenshots
@@ -133,6 +136,22 @@ All `/api/*` routes need `Authorization: Bearer $MEAD_API_TOKEN`. Bodies are JSO
 | `/healthz` | GET | Unauthenticated liveness check |
 
 `scripts/mead.py` is a small CLI over the API (`mead.py reading 3 1.050 --notes "day 5"`, `mead.py event 3 dilute --qt 1.6`). If the app sits behind Cloudflare, send a non-default User-Agent; the default `Python-urllib` UA is blocked by its bot check.
+
+### Planning, calculators, cellar
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/actions?days=14&batch_id=` | Sorted next actions (tasks + derived rules) |
+| GET/POST | `/api/tasks` | List (`?open=0` for all) / create `{batch_id, title, due_date, kind, details}` |
+| PATCH | `/api/task/<id>` | `{done, title, details, due_date}` (changing the date re-arms the notification) |
+| POST | `/api/batch/<id>/tosna` | Create TOSNA dose tasks from pitch date; `{n_level, dry_run}`; idempotent |
+| GET/POST | `/api/calc/<tosna\|dilution\|backsweeten\|honey>` | Pure calculators; pass `batch_id` to prefill |
+| GET | `/api/inventory` | Bottles in stock + recent log |
+| POST | `/api/batch/<id>/bottlings` | `{count, size_ml, closure, location, date}` |
+| POST | `/api/bottling/<id>/use` | `{qty, reason, date, notes}`; rejects overdrawing |
+| DELETE | `/api/tasks/<id>`, `/api/bottlings/<id>`, `/api/bottlelog/<id>` | |
+
+Calculator constants: honey 35 PPG and ~11.7 lb/gal, maple syrup 30 PPG (~66% sugar), Fermaid O 2.48 g per level tsp. TOSNA 2.0 uses Brix × 10 × N factor (low 0.75, medium 0.90, high 1.25) ÷ 50 grams per gallon over four doses.
 
 ## Export Endpoints (UI auth)
 

@@ -10,7 +10,7 @@ import json
 import shutil
 import sqlite3
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from contextlib import contextmanager
 
 from flask import (
@@ -23,12 +23,19 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from notifications import check_and_send_notifications, send_email, send_ntfy
 import meadcalc
-from meadcalc import EVENT_TYPES, event_label
+import planner
+from meadcalc import EVENT_TYPES, SWEETENERS, event_label
 import requests as http_requests
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("MEAD_SECRET_KEY") or os.urandom(24)
-app.jinja_env.globals.update(event_label=event_label, EVENT_TYPES=EVENT_TYPES)
+@app.context_processor
+def _inject_today():
+    return {"today": date.today().isoformat()}
+
+
+app.jinja_env.globals.update(event_label=event_label, EVENT_TYPES=EVENT_TYPES,
+                             SWEETENERS=SWEETENERS, TASK_KINDS=planner.TASK_KINDS)
 
 DB_PATH = os.environ.get(
     "MEAD_DB_PATH",
@@ -240,6 +247,44 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_events_batch ON process_events(batch_id, event_date);
+
+        -- Dated to-dos (nutrient doses, "strain by Oct 11"); derived rules live in planner.py
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER REFERENCES batches(id) ON DELETE CASCADE,
+            due_date TEXT,
+            title TEXT NOT NULL,
+            details TEXT DEFAULT '',
+            kind TEXT DEFAULT 'other',
+            auto_key TEXT,
+            done_at TEXT,
+            notified_at TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_open ON tasks(done_at, due_date);
+
+        -- Bottle inventory: one row per bottling run / bottle size
+        CREATE TABLE IF NOT EXISTS bottlings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+            bottle_date TEXT NOT NULL,
+            size_ml INTEGER NOT NULL DEFAULT 750,
+            count INTEGER NOT NULL CHECK(count >= 0),
+            closure TEXT DEFAULT '',
+            location TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS bottle_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bottling_id INTEGER NOT NULL REFERENCES bottlings(id) ON DELETE CASCADE,
+            log_date TEXT NOT NULL,
+            qty INTEGER NOT NULL DEFAULT 1 CHECK(qty > 0),
+            reason TEXT NOT NULL DEFAULT 'drank'
+                CHECK(reason IN ('drank','gifted','shared','competition','broken','other')),
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE INDEX IF NOT EXISTS idx_readings_batch ON gravity_readings(batch_id, reading_date);
 
         -- AI recipe generation settings
@@ -254,6 +299,9 @@ def init_db():
     cols = {row[1] for row in db.execute("PRAGMA table_info(batches)")}
     if "initial_volume_gal" not in cols:
         db.execute("ALTER TABLE batches ADD COLUMN initial_volume_gal REAL")
+    ev_cols = {row[1] for row in db.execute("PRAGMA table_info(process_events)")}
+    if "sweetener" not in ev_cols:
+        db.execute("ALTER TABLE process_events ADD COLUMN sweetener TEXT")
     db.commit()
     db.close()
 
@@ -351,7 +399,9 @@ def index():
             "diluted": st["diluted"],
         })
 
-    return render_template("index.html", batches=batch_data)
+    actions = collect_actions(db)
+    inv = bottle_totals(db)
+    return render_template("index.html", batches=batch_data, actions=actions, inv=inv)
 
 
 # ── Batch CRUD ────────────────────────────────────────────────────
@@ -428,11 +478,33 @@ def batch_detail(batch_id):
         for e in events
     ]
 
+    actions = collect_actions(db, batch_id=batch_id, horizon_days=60)
+    done_tasks = db.execute(
+        "SELECT * FROM tasks WHERE batch_id = ? AND done_at IS NOT NULL ORDER BY done_at DESC LIMIT 10",
+        (batch_id,)).fetchall()
+    bottlings = bottling_rows(db, batch_id)
+    bottle_log = db.execute(
+        """SELECT l.*, bt.size_ml FROM bottle_log l JOIN bottlings bt ON bt.id = l.bottling_id
+           WHERE bt.batch_id = ? ORDER BY l.log_date DESC, l.id DESC""", (batch_id,)).fetchall()
+    tosna = None
+    if batch["og"] and (batch["initial_volume_gal"] or batch["batch_size_gal"]):
+        try:
+            tosna = meadcalc.calc_tosna(batch["og"], batch["initial_volume_gal"] or batch["batch_size_gal"],
+                                        meadcalc.yeast_n_level(batch["yeast_strain"]))
+        except ValueError:
+            tosna = None
+
     return render_template(
         "batch.html",
         batch=batch,
         readings=readings,
         events=events,
+        actions=actions,
+        done_tasks=done_tasks,
+        bottlings=bottlings,
+        bottle_log=bottle_log,
+        bottle_inv=bottle_totals(db, batch_id),
+        tosna=tosna,
         calc=calc,
         chart_events=chart_events,
         nutrients=nutrients,
@@ -660,14 +732,17 @@ def insert_event(db, batch_id, data):
         raise ValueError("dilute requires volume_added_gal (or volume_added_qt / volume_added_cups)")
     day = data.get("day_number")
     day = int(day) if day not in (None, "") else day_number_for(db, batch_id, event_date)
+    sweetener = (data.get("sweetener") or "").strip() or None
+    if sweetener and sweetener not in SWEETENERS:
+        raise ValueError(f"sweetener must be one of: {', '.join(SWEETENERS)}")
     cur = db.execute(
         """INSERT INTO process_events
            (batch_id, event_date, day_number, event_type, volume_added_gal, sugar_lb,
-            volume_after_gal, gravity_before, gravity_after, amount, notes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            volume_after_gal, gravity_before, gravity_after, amount, notes, sweetener)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (batch_id, event_date, day, et, nums["volume_added_gal"], nums["sugar_lb"],
          nums["volume_after_gal"], nums["gravity_before"], nums["gravity_after"],
-         str(data.get("amount") or ""), str(data.get("notes") or "")),
+         str(data.get("amount") or ""), str(data.get("notes") or ""), sweetener),
     )
     return cur.lastrowid
 
@@ -701,6 +776,375 @@ def delete_event(event_id):
         flash("Event deleted.", "warning")
         return redirect(url_for("batch_detail", batch_id=row["batch_id"]) + "#process")
     return redirect(url_for("index"))
+
+
+# ── Next actions (tasks + derived rules) ──────────────────────────
+
+def insert_task(db, data):
+    title = (data.get("title") or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    due = (data.get("due_date") or data.get("due") or "").strip() or None
+    if due:
+        datetime.strptime(due, "%Y-%m-%d")
+    kind = data.get("kind") or "other"
+    if kind not in planner.TASK_KINDS:
+        raise ValueError(f"kind must be one of: {', '.join(planner.TASK_KINDS)}")
+    batch_id = data.get("batch_id")
+    batch_id = int(batch_id) if batch_id not in (None, "") else None
+    if batch_id is not None and not db.execute("SELECT 1 FROM batches WHERE id = ?", (batch_id,)).fetchone():
+        raise ValueError("batch not found")
+    cur = db.execute(
+        "INSERT INTO tasks (batch_id, due_date, title, details, kind, auto_key) VALUES (?, ?, ?, ?, ?, ?)",
+        (batch_id, due, title, str(data.get("details") or ""), kind, data.get("auto_key")),
+    )
+    return cur.lastrowid
+
+
+def collect_actions(db, batch_id=None, horizon_days=14, today=None):
+    """Open tasks due within the horizon (or undated/overdue) + rule-based actions."""
+    today = today or date.today()
+    horizon = (today + timedelta(days=horizon_days)).isoformat()
+    q = "SELECT * FROM tasks WHERE done_at IS NULL AND (due_date IS NULL OR due_date <= ?)"
+    params = [horizon]
+    if batch_id is not None:
+        q += " AND batch_id = ?"
+        params.append(batch_id)
+    tasks = db.execute(q, params).fetchall()
+
+    bq = "SELECT * FROM batches WHERE status != 'archived'"
+    bparams = []
+    if batch_id is not None:
+        bq += " AND id = ?"
+        bparams.append(batch_id)
+    batches = db.execute(bq, bparams).fetchall()
+    names = {b["id"]: b["name"] for b in db.execute("SELECT id, name FROM batches")}
+
+    actions = planner.task_actions(tasks, names, today)
+    for b in batches:
+        readings, events, calc = batch_calc(db, b)
+        ingredients = db.execute("SELECT * FROM ingredients WHERE batch_id = ?", (b["id"],)).fetchall()
+        nutrients = db.execute("SELECT * FROM nutrient_additions WHERE batch_id = ?", (b["id"],)).fetchall()
+        inv = bottle_totals(db, b["id"])
+        last_t = db.execute("SELECT MAX(tasting_date) FROM tasting_notes WHERE batch_id = ?",
+                            (b["id"],)).fetchone()[0]
+        actions += planner.derived_actions(
+            b, readings, events, calc, ingredients, inv["remaining"], inv["filled"] > 0,
+            last_t, nutrients=nutrients, today=today,
+        )
+    return planner.sort_actions(actions)
+
+
+@app.route("/batch/<int:batch_id>/task", methods=["POST"])
+def add_task(batch_id):
+    db = get_db()
+    try:
+        insert_task(db, {**request.form.to_dict(), "batch_id": batch_id})
+        db.commit()
+        flash("Task added.", "success")
+    except ValueError as e:
+        flash(f"Could not add task: {e}", "danger")
+    return redirect(url_for("batch_detail", batch_id=batch_id) + "#actions")
+
+
+@app.route("/batch/<int:batch_id>/tosna", methods=["POST"])
+def add_tosna_tasks(batch_id):
+    db = get_db()
+    batch = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    try:
+        rows, t = planner.tosna_tasks(batch, request.form.get("n_level") or None)
+    except (ValueError, TypeError) as e:
+        flash(f"Can't build a TOSNA schedule: {e}", "danger")
+        return redirect(url_for("batch_detail", batch_id=batch_id) + "#actions")
+    existing = {r["auto_key"] for r in db.execute(
+        "SELECT auto_key FROM tasks WHERE batch_id = ? AND auto_key IS NOT NULL", (batch_id,))}
+    added = 0
+    for row in rows:
+        if row["auto_key"] in existing:
+            continue
+        insert_task(db, {**row, "batch_id": batch_id})
+        added += 1
+    db.commit()
+    flash(f"TOSNA schedule: {t['total_g']} g Fermaid O total, {added} dose task(s) added"
+          + ("" if added == len(rows) else " (existing doses kept)") + ".", "success")
+    return redirect(url_for("batch_detail", batch_id=batch_id) + "#actions")
+
+
+@app.route("/task/<int:task_id>/<action>", methods=["POST"])
+def task_action(task_id, action):
+    db = get_db()
+    row = db.execute("SELECT batch_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row:
+        flash("Task not found.", "danger")
+        return redirect(url_for("index"))
+    if action == "done":
+        db.execute("UPDATE tasks SET done_at = datetime('now') WHERE id = ?", (task_id,))
+    elif action == "undo":
+        db.execute("UPDATE tasks SET done_at = NULL WHERE id = ?", (task_id,))
+    elif action == "delete":
+        db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    elif action == "snooze":
+        db.execute("UPDATE tasks SET due_date = date(COALESCE(due_date, date('now')), '+1 day'), "
+                   "notified_at = NULL WHERE id = ?", (task_id,))
+    else:
+        flash("Unknown task action.", "danger")
+    db.commit()
+    nxt = request.form.get("next")
+    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+        return redirect(nxt)
+    if row["batch_id"]:
+        return redirect(url_for("batch_detail", batch_id=row["batch_id"]) + "#actions")
+    return redirect(url_for("index"))
+
+
+# ── Bottle inventory ──────────────────────────────────────────────
+
+BOTTLE_REASONS = ("drank", "gifted", "shared", "competition", "broken", "other")
+app.jinja_env.globals.update(BOTTLE_REASONS=BOTTLE_REASONS)
+
+
+def bottling_rows(db, batch_id=None, in_stock_only=False):
+    q = """SELECT bt.*, b.name AS batch_name, b.status AS batch_status,
+                  COALESCE((SELECT SUM(qty) FROM bottle_log l WHERE l.bottling_id = bt.id), 0) AS used
+           FROM bottlings bt JOIN batches b ON b.id = bt.batch_id"""
+    params = []
+    if batch_id is not None:
+        q += " WHERE bt.batch_id = ?"
+        params.append(batch_id)
+    q += " ORDER BY bt.bottle_date DESC, bt.id DESC"
+    today = date.today()
+    out = []
+    for r_ in db.execute(q, params).fetchall():
+        d = dict(r_)
+        d["remaining"] = d["count"] - d["used"]
+        try:
+            d["age_days"] = (today - datetime.strptime(d["bottle_date"], "%Y-%m-%d").date()).days
+        except ValueError:
+            d["age_days"] = None
+        if in_stock_only and d["remaining"] <= 0:
+            continue
+        out.append(d)
+    return out
+
+
+def bottle_totals(db, batch_id=None):
+    rows = bottling_rows(db, batch_id)
+    return {
+        "filled": sum(r_["count"] for r_ in rows),
+        "remaining": sum(max(0, r_["remaining"]) for r_ in rows),
+        "remaining_ml": sum(max(0, r_["remaining"]) * r_["size_ml"] for r_ in rows),
+    }
+
+
+def insert_bottling(db, batch_id, data):
+    try:
+        count = int(data.get("count"))
+        size = int(data.get("size_ml") or 750)
+    except (TypeError, ValueError):
+        raise ValueError("count and size_ml must be whole numbers")
+    if count <= 0 or size <= 0:
+        raise ValueError("count and size_ml must be positive")
+    when = (data.get("bottle_date") or data.get("date") or date.today().isoformat()).strip()
+    datetime.strptime(when, "%Y-%m-%d")
+    cur = db.execute(
+        """INSERT INTO bottlings (batch_id, bottle_date, size_ml, count, closure, location, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (batch_id, when, size, count, str(data.get("closure") or ""),
+         str(data.get("location") or ""), str(data.get("notes") or "")),
+    )
+    # First bottling moves the batch along and sets bottled_date
+    b = db.execute("SELECT status, bottled_date FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if b and not b["bottled_date"]:
+        db.execute("UPDATE batches SET bottled_date = ? WHERE id = ?", (when, batch_id))
+    if b and b["status"] in ("planning", "active", "aging"):
+        db.execute("UPDATE batches SET status = 'bottled', updated_at = datetime('now') WHERE id = ?",
+                   (batch_id,))
+    return cur.lastrowid
+
+
+def insert_bottle_log(db, bottling_id, data):
+    bt = next((r_ for r_ in bottling_rows(db) if r_["id"] == bottling_id), None)
+    if not bt:
+        raise LookupError("bottling not found")
+    try:
+        qty = int(data.get("qty") or 1)
+    except (TypeError, ValueError):
+        raise ValueError("qty must be a whole number")
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+    if qty > bt["remaining"]:
+        raise ValueError(f"only {bt['remaining']} bottle(s) left in that bottling")
+    reason = data.get("reason") or "drank"
+    if reason not in BOTTLE_REASONS:
+        raise ValueError(f"reason must be one of: {', '.join(BOTTLE_REASONS)}")
+    when = (data.get("log_date") or data.get("date") or date.today().isoformat()).strip()
+    datetime.strptime(when, "%Y-%m-%d")
+    cur = db.execute(
+        "INSERT INTO bottle_log (bottling_id, log_date, qty, reason, notes) VALUES (?, ?, ?, ?, ?)",
+        (bottling_id, when, qty, reason, str(data.get("notes") or "")),
+    )
+    # Opening the first bottle means you're drinking it
+    b = db.execute("SELECT id, status FROM batches WHERE id = ?", (bt["batch_id"],)).fetchone()
+    if b["status"] == "bottled":
+        db.execute("UPDATE batches SET status = 'drinking', updated_at = datetime('now') WHERE id = ?",
+                   (b["id"],))
+    return cur.lastrowid, bt["batch_id"]
+
+
+def _back(default):
+    nxt = request.form.get("next")
+    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+        return redirect(nxt)
+    return redirect(default)
+
+
+@app.route("/batch/<int:batch_id>/bottling", methods=["POST"])
+def add_bottling(batch_id):
+    db = get_db()
+    try:
+        insert_bottling(db, batch_id, request.form)
+        db.commit()
+        flash(f"{request.form.get('count')} bottles added to inventory.", "success")
+    except ValueError as e:
+        flash(f"Could not add bottling: {e}", "danger")
+    return _back(url_for("batch_detail", batch_id=batch_id) + "#bottles")
+
+
+@app.route("/bottling/<int:bottling_id>/use", methods=["POST"])
+def use_bottle(bottling_id):
+    db = get_db()
+    try:
+        _, batch_id = insert_bottle_log(db, bottling_id, request.form)
+        db.commit()
+        flash("Logged. Cheers.", "success")
+        return _back(url_for("batch_detail", batch_id=batch_id) + "#bottles")
+    except LookupError:
+        flash("Bottling not found.", "danger")
+    except ValueError as e:
+        flash(f"Could not log bottle: {e}", "danger")
+    return _back(url_for("inventory"))
+
+
+@app.route("/bottling/<int:bottling_id>/delete", methods=["POST"])
+def delete_bottling(bottling_id):
+    db = get_db()
+    row = db.execute("SELECT batch_id FROM bottlings WHERE id = ?", (bottling_id,)).fetchone()
+    if row:
+        db.execute("DELETE FROM bottlings WHERE id = ?", (bottling_id,))
+        db.commit()
+        flash("Bottling removed.", "warning")
+        return _back(url_for("batch_detail", batch_id=row["batch_id"]) + "#bottles")
+    return redirect(url_for("inventory"))
+
+
+@app.route("/bottlelog/<int:log_id>/delete", methods=["POST"])
+def delete_bottle_log(log_id):
+    db = get_db()
+    row = db.execute("""SELECT bt.batch_id FROM bottle_log l JOIN bottlings bt ON bt.id = l.bottling_id
+                        WHERE l.id = ?""", (log_id,)).fetchone()
+    if row:
+        db.execute("DELETE FROM bottle_log WHERE id = ?", (log_id,))
+        db.commit()
+        flash("Entry removed; bottle back in stock.", "warning")
+        return _back(url_for("batch_detail", batch_id=row["batch_id"]) + "#bottles")
+    return redirect(url_for("inventory"))
+
+
+def inventory_data(db):
+    rows = bottling_rows(db, in_stock_only=True)
+    abv = {}
+    for bid in {r_["batch_id"] for r_ in rows}:
+        b = db.execute("SELECT * FROM batches WHERE id = ?", (bid,)).fetchone()
+        abv[bid] = batch_calc(db, b)[2]["state"]["abv_now"]
+    for r_ in rows:
+        r_["abv"] = abv.get(r_["batch_id"])
+    recent = db.execute(
+        """SELECT l.*, bt.size_ml, b.name AS batch_name, b.id AS batch_id
+           FROM bottle_log l JOIN bottlings bt ON bt.id = l.bottling_id JOIN batches b ON b.id = bt.batch_id
+           ORDER BY l.log_date DESC, l.id DESC LIMIT 25""").fetchall()
+    return {
+        "rows": rows,
+        "recent": [dict(x) for x in recent],
+        "total_bottles": sum(r_["remaining"] for r_ in rows),
+        "total_liters": round(sum(r_["remaining"] * r_["size_ml"] for r_ in rows) / 1000, 2),
+    }
+
+
+@app.route("/inventory")
+def inventory():
+    db = get_db()
+    return render_template("inventory.html", inv=inventory_data(db))
+
+
+# ── Calculators ───────────────────────────────────────────────────
+
+CALCS = {
+    "tosna": (meadcalc.calc_tosna, {"og": float, "volume_gal": float, "n_level": str}),
+    "dilution": (meadcalc.calc_dilution, {"volume_gal": float, "abv": float, "target_abv": float,
+                                           "water_gal": float, "gravity": float}),
+    "backsweeten": (meadcalc.calc_backsweeten, {"volume_gal": float, "current_sg": float,
+                                                 "target_sg": float, "sweetener": str, "abv": float}),
+    "honey": (meadcalc.calc_honey_for_og, {"volume_gal": float, "target_og": float, "sweetener": str}),
+}
+
+
+def run_calc(name, params):
+    fn, spec = CALCS[name]
+    kwargs = {}
+    for k, typ in spec.items():
+        v = params.get(k)
+        if v in (None, ""):
+            continue
+        try:
+            kwargs[k] = typ(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{k} must be a {typ.__name__}")
+    if name == "dilution" and kwargs.get("water_gal") is None and params.get("water_qt") not in (None, ""):
+        kwargs["water_gal"] = float(params["water_qt"]) / 4
+    try:
+        return fn(**kwargs)
+    except TypeError as e:
+        raise ValueError(f"missing input: {e}")
+
+
+def batch_calc_defaults(db, batch_id):
+    b = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if not b:
+        return None, {}
+    _, _, calc = batch_calc(db, b)
+    st = calc["state"]
+    fermenting = b["status"] == "active" and not st["stabilized"]
+    return b, {
+        "og": b["og"],
+        "volume_gal": st["volume_gal"],
+        "n_level": meadcalc.yeast_n_level(b["yeast_strain"]),
+        "abv": st["potential_abv"] if fermenting else st["abv_now"],
+        "abv_is_projection": fermenting,
+        "gravity": 0.998 if fermenting else st["current_gravity"],
+        "current_sg": st["current_gravity"],
+        "target_sg": b["target_fg"],
+        "target_abv": b["target_abv"],
+    }
+
+
+@app.route("/tools")
+def tools():
+    db = get_db()
+    batches = db.execute("SELECT id, name, status FROM batches WHERE status != 'archived' "
+                         "ORDER BY pitch_date DESC").fetchall()
+    batch, defaults = None, {}
+    if request.args.get("batch"):
+        batch, defaults = batch_calc_defaults(db, int(request.args["batch"]))
+    which = request.args.get("calc")
+    vals = {**{k: v for k, v in defaults.items() if v is not None}, **{k: v for k, v in request.args.items() if v != ""}}
+    results, errors = {}, {}
+    if which in CALCS:
+        try:
+            results[which] = run_calc(which, vals)
+        except ValueError as e:
+            errors[which] = str(e)
+    return render_template("tools.html", batches=batches, batch=batch, v=vals, which=which,
+                           results=results, errors=errors, defaults=defaults)
 
 
 # ── Backup / Restore / Export ───────────────────────────────────
@@ -741,6 +1185,14 @@ def _export_batch_dict(db, batch_id):
             (batch_id,),
         ).fetchall()
     ]
+    data["tasks"] = [
+        dict(t) for t in db.execute(
+            "SELECT * FROM tasks WHERE batch_id = ? ORDER BY due_date", (batch_id,)).fetchall()
+    ]
+    data["bottlings"] = bottling_rows(db, batch_id)
+    for bt in data["bottlings"]:
+        bt["log"] = [dict(l) for l in db.execute(
+            "SELECT * FROM bottle_log WHERE bottling_id = ? ORDER BY log_date", (bt["id"],)).fetchall()]
     return data
 
 
@@ -1609,12 +2061,146 @@ def _created(db, batch_id, table, row_id):
     return jsonify({"created": row, "batch": _batch_summary(db, b)}), 201
 
 
+@app.route("/api/actions")
+def api_actions():
+    db = get_db()
+    bid = request.args.get("batch_id")
+    horizon = int(request.args.get("days") or 14)
+    return jsonify(collect_actions(db, batch_id=int(bid) if bid else None, horizon_days=horizon))
+
+
+@app.route("/api/tasks", methods=["GET"])
+def api_tasks():
+    db = get_db()
+    q, params = "SELECT * FROM tasks", []
+    clauses = []
+    if request.args.get("batch_id"):
+        clauses.append("batch_id = ?")
+        params.append(int(request.args["batch_id"]))
+    if request.args.get("open", "1") == "1":
+        clauses.append("done_at IS NULL")
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY due_date IS NULL, due_date"
+    return jsonify([dict(t) for t in db.execute(q, params).fetchall()])
+
+
+@app.route("/api/tasks", methods=["POST"])
+def api_task_create():
+    db = get_db()
+    try:
+        tid = insert_task(db, _json_body())
+    except ValueError as e:
+        raise ApiError(str(e))
+    db.commit()
+    return jsonify(dict(db.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())), 201
+
+
+@app.route("/api/task/<int:task_id>", methods=["PATCH"])
+def api_task_update(task_id):
+    db = get_db()
+    if not db.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+        raise ApiError("task not found", 404)
+    data = _json_body()
+    sets, params = [], []
+    if "done" in data:
+        sets.append("done_at = " + ("datetime('now')" if data["done"] else "NULL"))
+    for k in ("title", "details"):
+        if k in data:
+            sets.append(f"{k} = ?")
+            params.append(str(data[k] or ""))
+    if "due_date" in data:
+        if data["due_date"]:
+            _date_or_today(data["due_date"])
+        sets.append("due_date = ?, notified_at = NULL")
+        params.append(data["due_date"] or None)
+    if not sets:
+        raise ApiError("nothing to update (done, title, details, due_date)")
+    db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", [*params, task_id])
+    db.commit()
+    return jsonify(dict(db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()))
+
+
+@app.route("/api/batch/<int:batch_id>/tosna", methods=["POST"])
+def api_tosna(batch_id):
+    """Create TOSNA dose tasks. Body: {"n_level": "low|medium|high", "dry_run": false}"""
+    db = get_db()
+    b = _api_batch(db, batch_id)
+    data = request.get_json(silent=True) or {}
+    try:
+        rows, t = planner.tosna_tasks(b, data.get("n_level"))
+    except (ValueError, TypeError) as e:
+        raise ApiError(str(e))
+    created = []
+    if not data.get("dry_run"):
+        existing = {r_["auto_key"] for r_ in db.execute(
+            "SELECT auto_key FROM tasks WHERE batch_id = ? AND auto_key IS NOT NULL", (batch_id,))}
+        for row in rows:
+            if row["auto_key"] not in existing:
+                created.append(insert_task(db, {**row, "batch_id": batch_id}))
+        db.commit()
+    return jsonify({"tosna": t, "schedule": rows, "created_task_ids": created})
+
+
+@app.route("/api/calc/<name>", methods=["GET", "POST"])
+def api_calc(name):
+    if name not in CALCS:
+        raise ApiError(f"unknown calculator; one of {', '.join(CALCS)}", 404)
+    params = dict(request.args)
+    if request.method == "POST":
+        params.update(_json_body())
+    if params.get("batch_id"):
+        db = get_db()
+        _, defaults = batch_calc_defaults(db, int(params["batch_id"]))
+        params = {**{k: v for k, v in defaults.items() if v is not None}, **params}
+    try:
+        return jsonify(run_calc(name, params))
+    except ValueError as e:
+        raise ApiError(str(e))
+
+
+@app.route("/api/inventory")
+def api_inventory():
+    return jsonify(inventory_data(get_db()))
+
+
+@app.route("/api/batch/<int:batch_id>/bottlings", methods=["POST"])
+def api_bottling_create(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    try:
+        bid = insert_bottling(db, batch_id, _json_body())
+    except ValueError as e:
+        raise ApiError(str(e))
+    db.commit()
+    row = next(r_ for r_ in bottling_rows(db, batch_id) if r_["id"] == bid)
+    return jsonify({"created": row, "batch": _batch_summary(db, _api_batch(db, batch_id))}), 201
+
+
+@app.route("/api/bottling/<int:bottling_id>/use", methods=["POST"])
+def api_bottle_use(bottling_id):
+    db = get_db()
+    try:
+        lid, batch_id = insert_bottle_log(db, bottling_id, request.get_json(silent=True) or {})
+    except LookupError:
+        raise ApiError("bottling not found", 404)
+    except ValueError as e:
+        raise ApiError(str(e))
+    db.commit()
+    row = next(r_ for r_ in bottling_rows(db, batch_id) if r_["id"] == bottling_id)
+    return jsonify({"log_id": lid, "bottling": row}), 201
+
+
+
 DELETABLE = {
     "readings": "gravity_readings",
     "events": "process_events",
     "nutrients": "nutrient_additions",
     "tastings": "tasting_notes",
     "ingredients": "ingredients",
+    "tasks": "tasks",
+    "bottlings": "bottlings",
+    "bottlelog": "bottle_log",
 }
 
 
@@ -1624,12 +2210,17 @@ def api_row_delete(kind, row_id):
     if not table:
         raise ApiError("not found", 404)
     db = get_db()
-    row = db.execute(f"SELECT batch_id FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    if table == "bottle_log":
+        row = db.execute("""SELECT bt.batch_id FROM bottle_log l JOIN bottlings bt ON bt.id = l.bottling_id
+                            WHERE l.id = ?""", (row_id,)).fetchone()
+    else:
+        row = db.execute(f"SELECT batch_id FROM {table} WHERE id = ?", (row_id,)).fetchone()
     if not row:
         raise ApiError("not found", 404)
     db.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
     db.commit()
-    return jsonify({"deleted": row_id, "batch": _batch_summary(db, _api_batch(db, row["batch_id"]))})
+    batch = _batch_summary(db, _api_batch(db, row["batch_id"])) if row["batch_id"] else None
+    return jsonify({"deleted": row_id, "batch": batch})
 
 
 # ── Background Scheduler ──────────────────────────────────────────
