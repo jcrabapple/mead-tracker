@@ -8,3 +8,5 @@ mead.db
 *.db-shm
 .env
 .DS_Store
+.pytest_cache/
+credentials

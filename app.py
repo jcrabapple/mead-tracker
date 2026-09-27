@@ -2,6 +2,9 @@
 
 import os
 import io
+import hmac
+import hashlib
+import secrets
 import csv
 import json
 import shutil
@@ -15,18 +18,89 @@ from flask import (
     jsonify, flash, g, send_file, Response
 )
 from werkzeug.utils import secure_filename
+from werkzeug.security import check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from notifications import check_and_send_notifications, send_email, send_ntfy
+import meadcalc
+from meadcalc import EVENT_TYPES, event_label
 import requests as http_requests
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+app.secret_key = os.environ.get("MEAD_SECRET_KEY") or os.urandom(24)
+app.jinja_env.globals.update(event_label=event_label, EVENT_TYPES=EVENT_TYPES)
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mead.db")
+DB_PATH = os.environ.get(
+    "MEAD_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "mead.db"),
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# ── Authentication ────────────────────────────────────────────────
+#
+# Browser UI: HTTP Basic auth. MEAD_USER + MEAD_PASSWORD_HASH (werkzeug hash).
+# /api/*:     Authorization: Bearer $MEAD_API_TOKEN (Basic also accepted).
+# If no credentials are configured the app refuses every request rather than
+# silently running open. Set MEAD_AUTH_DISABLED=1 for local dev/tests only.
+
+AUTH_USER = os.environ.get("MEAD_USER", "")
+AUTH_PASS_HASH = os.environ.get("MEAD_PASSWORD_HASH", "")
+API_TOKEN = os.environ.get("MEAD_API_TOKEN", "")
+AUTH_DISABLED = os.environ.get("MEAD_AUTH_DISABLED") == "1"
+PUBLIC_PATHS = {"/healthz"}
+
+
+def _basic_ok(auth):
+    if not auth or not AUTH_USER or not AUTH_PASS_HASH:
+        return False
+    user_ok = hmac.compare_digest(auth.username or "", AUTH_USER)
+    pass_ok = check_password_hash(AUTH_PASS_HASH, auth.password or "")
+    return user_ok and pass_ok
+
+
+def _bearer_ok():
+    header = request.headers.get("Authorization", "")
+    if not API_TOKEN or not header.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(header[7:].strip(), API_TOKEN)
+
+
+def _same_origin_ok():
+    """Basic-auth credentials are sent automatically by the browser, so a
+    cross-site form POST would be authenticated. Reject state-changing
+    browser requests whose Origin/Referer is a different host."""
+    src = request.headers.get("Origin") or request.headers.get("Referer")
+    if not src:
+        return True  # curl, API clients, some privacy-stripped browsers
+    from urllib.parse import urlparse
+    return urlparse(src).netloc == request.host
+
+
+@app.before_request
+def require_auth():
+    if AUTH_DISABLED or request.path in PUBLIC_PATHS:
+        return None
+    is_api = request.path.startswith("/api/")
+    if is_api and _bearer_ok():
+        return None
+    if _basic_ok(request.authorization):
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not is_api and not _same_origin_ok():
+            return Response("Cross-origin request blocked.", 403)
+        return None
+    if is_api:
+        return jsonify({"error": "unauthorized"}), 401
+    return Response(
+        "Authentication required.", 401,
+        {"WWW-Authenticate": 'Basic realm="Mead Tracker", charset="UTF-8"'},
+    )
+
+
+@app.route("/healthz")
+def healthz():
+    return {"ok": True}
 
 
 # ── Database helpers ──────────────────────────────────────────────
@@ -149,6 +223,25 @@ def init_db():
             status TEXT DEFAULT 'sent',
             error TEXT
         );
+        -- Process events: dilution, backsweetening, racking, stabilizing...
+        CREATE TABLE IF NOT EXISTS process_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+            event_date TEXT NOT NULL,
+            day_number INTEGER,
+            event_type TEXT NOT NULL,
+            volume_added_gal REAL,
+            sugar_lb REAL,
+            volume_after_gal REAL,
+            gravity_before REAL,
+            gravity_after REAL,
+            amount TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_batch ON process_events(batch_id, event_date);
+        CREATE INDEX IF NOT EXISTS idx_readings_batch ON gravity_readings(batch_id, reading_date);
+
         -- AI recipe generation settings
         CREATE TABLE IF NOT EXISTS ai_settings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,10 +250,21 @@ def init_db():
             updated_at TEXT DEFAULT (datetime('now'))
         );
     """)
+    # Column migrations (SQLite has no ADD COLUMN IF NOT EXISTS)
+    cols = {row[1] for row in db.execute("PRAGMA table_info(batches)")}
+    if "initial_volume_gal" not in cols:
+        db.execute("ALTER TABLE batches ADD COLUMN initial_volume_gal REAL")
+    db.commit()
     db.close()
 
 
 # ── Utility ───────────────────────────────────────────────────────
+
+def _opt_float(v):
+    if v is None or str(v).strip() == "":
+        return None
+    return float(v)
+
 
 def calc_abv(og, gravity):
     """Estimate ABV from OG and current/final gravity."""
@@ -174,6 +278,32 @@ def calc_potential_abv(og):
     if og:
         return round((og - 0.996) * 131.25, 1)
     return None
+
+
+def day_number_for(db, batch_id, when):
+    """Days since pitch for an ISO date, or None."""
+    row = db.execute("SELECT pitch_date FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if not row or not row["pitch_date"] or not when:
+        return None
+    try:
+        pitch = datetime.strptime(row["pitch_date"], "%Y-%m-%d").date()
+        return (datetime.strptime(when, "%Y-%m-%d").date() - pitch).days
+    except ValueError:
+        return None
+
+
+def batch_calc(db, batch):
+    """Run the event-aware fermentation math for one batch."""
+    readings = db.execute(
+        "SELECT * FROM gravity_readings WHERE batch_id = ? ORDER BY reading_date, created_at, id",
+        (batch["id"],),
+    ).fetchall()
+    events = db.execute(
+        "SELECT * FROM process_events WHERE batch_id = ? ORDER BY event_date, created_at, id",
+        (batch["id"],),
+    ).fetchall()
+    result = meadcalc.compute(dict(batch), [dict(r) for r in readings], [dict(e) for e in events])
+    return readings, events, result
 
 
 app.jinja_env.globals.update(calc_abv=calc_abv, calc_potential_abv=calc_potential_abv)
@@ -208,16 +338,18 @@ def index():
         "END, pitch_date DESC"
     ).fetchall()
 
-    # Attach latest gravity to each batch
+    # Attach event-aware current state to each batch
     batch_data = []
     for b in batches:
-        latest = db.execute(
-            "SELECT gravity, reading_date FROM gravity_readings "
-            "WHERE batch_id = ? ORDER BY reading_date DESC LIMIT 1",
-            (b["id"],)
-        ).fetchone()
-        abv = calc_abv(b["og"], latest["gravity"]) if latest and b["og"] else None
-        batch_data.append({**dict(b), "latest_gravity": latest, "current_abv": abv})
+        readings, events, calc = batch_calc(db, b)
+        st = calc["state"]
+        batch_data.append({
+            **dict(b),
+            "current_gravity": st["current_gravity"] if (readings or events) else None,
+            "current_abv": st["abv_now"] if (readings or events or b["fg"]) else None,
+            "volume_now": st["volume_gal"],
+            "diluted": st["diluted"],
+        })
 
     return render_template("index.html", batches=batch_data)
 
@@ -230,13 +362,14 @@ def batch_new():
         db = get_db()
         db.execute(
             """INSERT INTO batches
-               (name, style, batch_size_gal, honey_type, yeast_strain,
+               (name, style, batch_size_gal, initial_volume_gal, honey_type, yeast_strain,
                 og, target_fg, target_abv, status, pitch_date, notes, recipe_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 request.form["name"],
                 request.form.get("style", ""),
                 float(request.form.get("batch_size_gal", 1.0) or 1.0),
+                _opt_float(request.form.get("initial_volume_gal")),
                 request.form.get("honey_type", ""),
                 request.form.get("yeast_strain", ""),
                 float(request.form["og"]) if request.form.get("og") else None,
@@ -262,10 +395,7 @@ def batch_detail(batch_id):
         flash("Batch not found.", "danger")
         return redirect(url_for("index"))
 
-    readings = db.execute(
-        "SELECT * FROM gravity_readings WHERE batch_id = ? ORDER BY reading_date",
-        (batch_id,),
-    ).fetchall()
+    readings, events, calc = batch_calc(db, batch)
 
     nutrients = db.execute(
         "SELECT * FROM nutrient_additions WHERE batch_id = ? ORDER BY addition_date",
@@ -289,18 +419,22 @@ def batch_detail(batch_id):
     ).fetchall()
     notif_rules_dict = {r["event_type"]: dict(r) for r in notif_rules}
 
-    # Build chart data
+    # Build chart data (ABV is event-aware, so dilution shows as a step down)
     chart_labels = [r["reading_date"] for r in readings]
     chart_gravities = [r["gravity"] for r in readings]
-    chart_abvs = [
-        calc_abv(batch["og"], r["gravity"]) if batch["og"] else 0
-        for r in readings
+    chart_abvs = [calc["readings"].get(r["id"], {}).get("abv") or 0 for r in readings]
+    chart_events = [
+        {"date": e["event_date"], "label": event_label(e["event_type"])}
+        for e in events
     ]
 
     return render_template(
         "batch.html",
         batch=batch,
         readings=readings,
+        events=events,
+        calc=calc,
+        chart_events=chart_events,
         nutrients=nutrients,
         tastings=tastings,
         ingredients=ingredients,
@@ -322,7 +456,7 @@ def batch_edit(batch_id):
     if request.method == "POST":
         db.execute(
             """UPDATE batches SET
-               name=?, style=?, batch_size_gal=?, honey_type=?, yeast_strain=?,
+               name=?, style=?, batch_size_gal=?, initial_volume_gal=?, honey_type=?, yeast_strain=?,
                og=?, fg=?, target_fg=?, target_abv=?, status=?,
                pitch_date=?, bottled_date=?, notes=?, recipe_source=?,
                updated_at=datetime('now')
@@ -331,6 +465,7 @@ def batch_edit(batch_id):
                 request.form["name"],
                 request.form.get("style", ""),
                 float(request.form.get("batch_size_gal", 1.0) or 1.0),
+                _opt_float(request.form.get("initial_volume_gal")),
                 request.form.get("honey_type", ""),
                 request.form.get("yeast_strain", ""),
                 float(request.form["og"]) if request.form.get("og") else None,
@@ -495,6 +630,79 @@ def add_ingredient(batch_id):
     return redirect(url_for("batch_detail", batch_id=batch_id))
 
 
+# ── Process events ────────────────────────────────────────────────
+
+def insert_event(db, batch_id, data):
+    """Validate and insert a process event. Raises ValueError on bad input."""
+    et = (data.get("event_type") or "").strip()
+    if et not in EVENT_TYPES:
+        raise ValueError(f"event_type must be one of: {', '.join(EVENT_TYPES)}")
+    event_date = (data.get("event_date") or data.get("date") or date.today().isoformat()).strip()
+    datetime.strptime(event_date, "%Y-%m-%d")
+    nums = {}
+    for k in ("volume_added_gal", "sugar_lb", "volume_after_gal", "gravity_before", "gravity_after"):
+        nums[k] = _opt_float(data.get(k))
+    for k in ("gravity_before", "gravity_after"):
+        if nums[k] is not None and not (0.900 <= nums[k] <= 1.250):
+            raise ValueError(f"{k} out of range (0.900-1.250)")
+    for k in ("volume_added_gal", "sugar_lb", "volume_after_gal"):
+        if nums[k] is not None and nums[k] < 0:
+            raise ValueError(f"{k} cannot be negative")
+    # Unit convenience: accept quarts/cups/oz and convert
+    if nums["volume_added_gal"] is None:
+        if _opt_float(data.get("volume_added_qt")) is not None:
+            nums["volume_added_gal"] = float(data["volume_added_qt"]) / 4.0
+        elif _opt_float(data.get("volume_added_cups")) is not None:
+            nums["volume_added_gal"] = float(data["volume_added_cups"]) / 16.0
+    if nums["sugar_lb"] is None and _opt_float(data.get("sugar_oz")) is not None:
+        nums["sugar_lb"] = float(data["sugar_oz"]) / 16.0
+    if et == "dilute" and not nums["volume_added_gal"]:
+        raise ValueError("dilute requires volume_added_gal (or volume_added_qt / volume_added_cups)")
+    day = data.get("day_number")
+    day = int(day) if day not in (None, "") else day_number_for(db, batch_id, event_date)
+    cur = db.execute(
+        """INSERT INTO process_events
+           (batch_id, event_date, day_number, event_type, volume_added_gal, sugar_lb,
+            volume_after_gal, gravity_before, gravity_after, amount, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (batch_id, event_date, day, et, nums["volume_added_gal"], nums["sugar_lb"],
+         nums["volume_after_gal"], nums["gravity_before"], nums["gravity_after"],
+         str(data.get("amount") or ""), str(data.get("notes") or "")),
+    )
+    return cur.lastrowid
+
+
+@app.route("/batch/<int:batch_id>/event", methods=["POST"])
+def add_event(batch_id):
+    db = get_db()
+    form = request.form.to_dict()
+    # The form offers volume in a unit dropdown
+    unit = form.pop("volume_unit", "gal")
+    if form.get("volume_added") not in (None, ""):
+        form[{"gal": "volume_added_gal", "qt": "volume_added_qt", "cups": "volume_added_cups"}.get(unit, "volume_added_gal")] = form.pop("volume_added")
+    if form.get("sugar_oz") in (None, ""):
+        form.pop("sugar_oz", None)
+    try:
+        insert_event(db, batch_id, form)
+        db.commit()
+        flash(f"{event_label(form['event_type'])} logged.", "success")
+    except (ValueError, KeyError) as e:
+        flash(f"Could not log event: {e}", "danger")
+    return redirect(url_for("batch_detail", batch_id=batch_id) + "#process")
+
+
+@app.route("/event/<int:event_id>/delete", methods=["POST"])
+def delete_event(event_id):
+    db = get_db()
+    row = db.execute("SELECT batch_id FROM process_events WHERE id = ?", (event_id,)).fetchone()
+    if row:
+        db.execute("DELETE FROM process_events WHERE id = ?", (event_id,))
+        db.commit()
+        flash("Event deleted.", "warning")
+        return redirect(url_for("batch_detail", batch_id=row["batch_id"]) + "#process")
+    return redirect(url_for("index"))
+
+
 # ── Backup / Restore / Export ───────────────────────────────────
 
 def _export_batch_dict(db, batch_id):
@@ -524,6 +732,12 @@ def _export_batch_dict(db, batch_id):
     data["tasting_notes"] = [
         dict(t) for t in db.execute(
             "SELECT * FROM tasting_notes WHERE batch_id = ? ORDER BY tasting_date DESC",
+            (batch_id,),
+        ).fetchall()
+    ]
+    data["process_events"] = [
+        dict(e) for e in db.execute(
+            "SELECT * FROM process_events WHERE batch_id = ? ORDER BY event_date, created_at, id",
             (batch_id,),
         ).fetchall()
     ]
@@ -610,8 +824,12 @@ def backup_restore():
         flash(f"Invalid SQLite file: {e}", "danger")
         return redirect(url_for("settings"))
 
-    # Replace the database
+    # Replace the database, then bring its schema up to date
     shutil.move(tmp_path, DB_PATH)
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(DB_PATH + suffix):
+            os.remove(DB_PATH + suffix)
+    init_db()
     flash("Database restored successfully! Refresh to see your data.", "success")
     return redirect(url_for("index"))
 
@@ -660,7 +878,8 @@ def export_csv():
                 (b["id"],)
             ).fetchall()
         )
-        current_abv = calc_abv(b["og"], latest["gravity"]) if latest and b["og"] else ""
+        _, _, calc = batch_calc(db, b)
+        current_abv = calc["state"]["abv_now"] if latest or b["fg"] else ""
         writer.writerow([
             b["id"], b["name"], b["style"], b["batch_size_gal"],
             b["honey_type"], b["yeast_strain"], b["og"] or "", b["fg"] or "",
@@ -1087,40 +1306,368 @@ def test_ai_connection():
 
 
 # ── API (for charts / future mobile app) ─────────────────────────
+#
+# JSON API. Auth: Authorization: Bearer $MEAD_API_TOKEN.
+# All write endpoints accept JSON bodies and return the created row plus the
+# batch's recomputed state, so a client can report the new ABV immediately.
 
-@app.route("/api/batches")
+class ApiError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+@app.errorhandler(ApiError)
+def _api_error(e):
+    return jsonify({"error": str(e)}), e.status
+
+
+def _json_body():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ApiError("expected a JSON object body")
+    return data
+
+
+def _api_batch(db, batch_id):
+    b = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if not b:
+        raise ApiError("batch not found", 404)
+    return b
+
+
+def _batch_summary(db, b):
+    _, _, calc = batch_calc(db, b)
+    st = calc["state"]
+    return {**dict(b), "state": {
+        k: st[k] for k in ("current_gravity", "abv_now", "potential_abv", "volume_gal",
+                           "carry_abv", "equivalent_og", "stabilized", "diluted", "segments")
+    }}
+
+
+def _date_or_today(v):
+    v = (v or date.today().isoformat()).strip()
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+    except ValueError:
+        raise ApiError("date must be YYYY-MM-DD")
+    return v
+
+
+def _gravity(v, name="gravity", required=True):
+    if v in (None, ""):
+        if required:
+            raise ApiError(f"{name} is required")
+        return None
+    try:
+        g_ = float(v)
+    except (TypeError, ValueError):
+        raise ApiError(f"{name} must be a number")
+    if not 0.900 <= g_ <= 1.250:
+        raise ApiError(f"{name} out of range (0.900-1.250)")
+    return g_
+
+
+BATCH_FIELDS = {
+    "name": str, "style": str, "batch_size_gal": float, "initial_volume_gal": float,
+    "honey_type": str, "yeast_strain": str, "og": float, "fg": float,
+    "target_fg": float, "target_abv": float, "status": str, "pitch_date": str,
+    "bottled_date": str, "notes": str, "recipe_source": str,
+}
+STATUSES = ("planning", "active", "aging", "bottled", "drinking", "archived")
+
+
+def _clean_batch_fields(data):
+    out = {}
+    for k, typ in BATCH_FIELDS.items():
+        if k not in data:
+            continue
+        v = data[k]
+        if v in (None, "") and typ is float:
+            out[k] = None
+            continue
+        try:
+            out[k] = typ(v) if v is not None else None
+        except (TypeError, ValueError):
+            raise ApiError(f"{k} must be {typ.__name__}")
+    if "status" in out and out["status"] not in STATUSES:
+        raise ApiError(f"status must be one of {', '.join(STATUSES)}")
+    for k in ("og", "fg", "target_fg"):
+        if out.get(k) is not None:
+            _gravity(out[k], k)
+    for k in ("pitch_date", "bottled_date"):
+        if out.get(k):
+            _date_or_today(out[k])
+    return out
+
+
+@app.route("/api/event-types")
+def api_event_types():
+    return jsonify({k: {"label": v[0], "affects_math": v[1]} for k, v in EVENT_TYPES.items()})
+
+
+@app.route("/api/batches", methods=["GET"])
 def api_batches():
     db = get_db()
-    batches = db.execute("SELECT * FROM batches ORDER BY pitch_date DESC").fetchall()
-    return jsonify([dict(b) for b in batches])
+    q, params = "SELECT * FROM batches", []
+    clauses = []
+    if request.args.get("status"):
+        clauses.append("status = ?")
+        params.append(request.args["status"])
+    if request.args.get("q"):
+        clauses.append("name LIKE ?")
+        params.append(f"%{request.args['q']}%")
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY pitch_date DESC"
+    return jsonify([_batch_summary(db, b) for b in db.execute(q, params).fetchall()])
 
 
-@app.route("/api/batch/<int:batch_id>/readings")
+@app.route("/api/batches", methods=["POST"])
+def api_batch_create():
+    db = get_db()
+    data = _clean_batch_fields(_json_body())
+    if not data.get("name"):
+        raise ApiError("name is required")
+    data.setdefault("status", "planning")
+    data.setdefault("batch_size_gal", 1.0)
+    cols = ", ".join(data)
+    cur = db.execute(
+        f"INSERT INTO batches ({cols}) VALUES ({', '.join('?' * len(data))})",
+        list(data.values()),
+    )
+    db.commit()
+    return jsonify(_batch_summary(db, _api_batch(db, cur.lastrowid))), 201
+
+
+@app.route("/api/batch/<int:batch_id>", methods=["GET"])
+def api_batch_get(batch_id):
+    db = get_db()
+    b = _api_batch(db, batch_id)
+    data = _export_batch_dict(db, batch_id)
+    _, _, calc = batch_calc(db, b)
+    for r_ in data["gravity_readings"]:
+        r_["abv"] = calc["readings"].get(r_["id"], {}).get("abv")
+    for e_ in data["process_events"]:
+        e_.update(calc["events"].get(e_["id"], {}))
+    data["state"] = calc["state"]
+    return jsonify(data)
+
+
+@app.route("/api/batch/<int:batch_id>", methods=["PATCH"])
+def api_batch_update(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    data = _clean_batch_fields(_json_body())
+    if not data:
+        raise ApiError("no updatable fields supplied")
+    sets = ", ".join(f"{k} = ?" for k in data)
+    db.execute(
+        f"UPDATE batches SET {sets}, updated_at = datetime('now') WHERE id = ?",
+        [*data.values(), batch_id],
+    )
+    db.commit()
+    return jsonify(_batch_summary(db, _api_batch(db, batch_id)))
+
+
+@app.route("/api/batch/<int:batch_id>", methods=["DELETE"])
+def api_batch_delete(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    if request.args.get("confirm") != "yes":
+        raise ApiError("deleting a batch removes all its data; repeat with ?confirm=yes")
+    db.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
+    db.commit()
+    return jsonify({"deleted": batch_id})
+
+
+@app.route("/api/batch/<int:batch_id>/readings", methods=["GET"])
 def api_readings(batch_id):
     db = get_db()
-    readings = db.execute(
-        "SELECT * FROM gravity_readings WHERE batch_id = ? ORDER BY reading_date",
-        (batch_id,),
-    ).fetchall()
-    return jsonify([dict(r) for r in readings])
+    b = _api_batch(db, batch_id)
+    readings, _, calc = batch_calc(db, b)
+    return jsonify([
+        {**dict(r_), "abv": calc["readings"].get(r_["id"], {}).get("abv")} for r_ in readings
+    ])
+
+
+@app.route("/api/batch/<int:batch_id>/readings", methods=["POST"])
+def api_reading_create(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    data = _json_body()
+    gravity = _gravity(data.get("gravity"))
+    when = _date_or_today(data.get("reading_date") or data.get("date"))
+    temp = data.get("temperature_f")
+    try:
+        temp = float(temp) if temp not in (None, "") else None
+    except (TypeError, ValueError):
+        raise ApiError("temperature_f must be a number")
+    day = data.get("day_number")
+    day = int(day) if day not in (None, "") else day_number_for(db, batch_id, when)
+    cur = db.execute(
+        """INSERT INTO gravity_readings (batch_id, reading_date, day_number, gravity, temperature_f, notes)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (batch_id, when, day, gravity, temp, str(data.get("notes") or "")),
+    )
+    db.commit()
+    return _created(db, batch_id, "gravity_readings", cur.lastrowid)
+
+
+@app.route("/api/batch/<int:batch_id>/nutrients", methods=["POST"])
+def api_nutrient_create(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    data = _json_body()
+    if not data.get("nutrient_type") or not data.get("amount"):
+        raise ApiError("nutrient_type and amount are required")
+    when = _date_or_today(data.get("addition_date") or data.get("date"))
+    day = data.get("day_number")
+    day = int(day) if day not in (None, "") else day_number_for(db, batch_id, when)
+    cur = db.execute(
+        """INSERT INTO nutrient_additions (batch_id, addition_date, day_number, nutrient_type, amount, notes)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (batch_id, when, day, str(data["nutrient_type"]), str(data["amount"]), str(data.get("notes") or "")),
+    )
+    db.commit()
+    return _created(db, batch_id, "nutrient_additions", cur.lastrowid)
+
+
+@app.route("/api/batch/<int:batch_id>/tastings", methods=["POST"])
+def api_tasting_create(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    data = _json_body()
+    rating = data.get("overall_rating")
+    if rating not in (None, ""):
+        try:
+            rating = int(rating)
+        except (TypeError, ValueError):
+            raise ApiError("overall_rating must be an integer 1-10")
+        if not 1 <= rating <= 10:
+            raise ApiError("overall_rating must be 1-10")
+    else:
+        rating = None
+    cur = db.execute(
+        """INSERT INTO tasting_notes
+           (batch_id, tasting_date, aroma, flavor, body, sweetness, overall_rating, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (batch_id, _date_or_today(data.get("tasting_date") or data.get("date")),
+         *(str(data.get(k) or "") for k in ("aroma", "flavor", "body", "sweetness")),
+         rating, str(data.get("notes") or "")),
+    )
+    db.commit()
+    return _created(db, batch_id, "tasting_notes", cur.lastrowid)
+
+
+@app.route("/api/batch/<int:batch_id>/ingredients", methods=["POST"])
+def api_ingredient_create(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    data = _json_body()
+    if not data.get("name"):
+        raise ApiError("name is required")
+    cat = data.get("category") or "other"
+    if cat not in ("honey", "fruit", "spice", "nutrient", "yeast", "other"):
+        raise ApiError("category must be honey, fruit, spice, nutrient, yeast, or other")
+    cur = db.execute(
+        "INSERT INTO ingredients (batch_id, category, name, amount, notes) VALUES (?, ?, ?, ?, ?)",
+        (batch_id, cat, str(data["name"]), str(data.get("amount") or ""), str(data.get("notes") or "")),
+    )
+    db.commit()
+    return _created(db, batch_id, "ingredients", cur.lastrowid)
+
+
+@app.route("/api/batch/<int:batch_id>/events", methods=["GET"])
+def api_events(batch_id):
+    db = get_db()
+    b = _api_batch(db, batch_id)
+    _, events, calc = batch_calc(db, b)
+    return jsonify([{**dict(e_), **calc["events"].get(e_["id"], {})} for e_ in events])
+
+
+@app.route("/api/batch/<int:batch_id>/events", methods=["POST"])
+def api_event_create(batch_id):
+    db = get_db()
+    _api_batch(db, batch_id)
+    try:
+        new_id = insert_event(db, batch_id, _json_body())
+    except ValueError as e:
+        raise ApiError(str(e))
+    db.commit()
+    return _created(db, batch_id, "process_events", new_id)
+
+
+def _created(db, batch_id, table, row_id):
+    row = dict(db.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone())
+    b = _api_batch(db, batch_id)
+    _, _, calc = batch_calc(db, b)
+    if table == "gravity_readings":
+        row["abv"] = calc["readings"].get(row_id, {}).get("abv")
+    elif table == "process_events":
+        row.update(calc["events"].get(row_id, {}))
+    return jsonify({"created": row, "batch": _batch_summary(db, b)}), 201
+
+
+DELETABLE = {
+    "readings": "gravity_readings",
+    "events": "process_events",
+    "nutrients": "nutrient_additions",
+    "tastings": "tasting_notes",
+    "ingredients": "ingredients",
+}
+
+
+@app.route("/api/<kind>/<int:row_id>", methods=["DELETE"])
+def api_row_delete(kind, row_id):
+    table = DELETABLE.get(kind)
+    if not table:
+        raise ApiError("not found", 404)
+    db = get_db()
+    row = db.execute(f"SELECT batch_id FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    if not row:
+        raise ApiError("not found", 404)
+    db.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+    db.commit()
+    return jsonify({"deleted": row_id, "batch": _batch_summary(db, _api_batch(db, row["batch_id"]))})
 
 
 # ── Background Scheduler ──────────────────────────────────────────
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(
-    check_and_send_notifications,
-    'interval',
-    hours=1,
-    args=[app, DB_PATH],
-    id='check_notifications',
-    replace_existing=True,
-)
-scheduler.start()
+# Started explicitly by the entry point, never on import, so tests and any
+# reloader child don't spin up a second copy that double-sends reminders.
+scheduler = None
+
+
+def start_scheduler():
+    global scheduler
+    if scheduler is not None:
+        return scheduler
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        check_and_send_notifications,
+        'interval',
+        hours=1,
+        args=[app, DB_PATH],
+        id='check_notifications',
+        replace_existing=True,
+    )
+    scheduler.start()
+    return scheduler
 
 
 # ── Entry point ───────────────────────────────────────────────────
 
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    app.run(host="127.0.0.1", port=8789, debug=True)
+    if not AUTH_DISABLED and not (AUTH_USER and AUTH_PASS_HASH):
+        logger.warning("MEAD_USER / MEAD_PASSWORD_HASH not set: every UI request will get 401.")
+    start_scheduler()
+    host = os.environ.get("MEAD_HOST", "127.0.0.1")
+    port = int(os.environ.get("MEAD_PORT", "8789"))
+    if os.environ.get("MEAD_DEV") == "1":
+        app.run(host=host, port=port, debug=True, use_reloader=False)
+    else:
+        from waitress import serve
+        serve(app, host=host, port=port, threads=8)

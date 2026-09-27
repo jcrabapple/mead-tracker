@@ -33,10 +33,18 @@
                                 {% endfor %}
                             </select>
                         </div>
-                        <div class="col-md-6">
+                        <div class="col-md-3">
                             <label class="form-label">Batch Size (gal)</label>
                             <input type="number" name="batch_size_gal" step="0.1" min="0.1" class="form-control"
                                    value="{{ batch.batch_size_gal if batch else '1.0' }}">
+                            <div class="form-text">Target / vessel size</div>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Must Volume at Pitch</label>
+                            <input type="number" name="initial_volume_gal" step="0.01" min="0.05" class="form-control"
+                                   value="{{ batch.initial_volume_gal if batch and batch.initial_volume_gal else '' }}"
+                                   placeholder="same as size">
+                            <div class="form-text">Actual liquid (gal), if different</div>
                         </div>
 
                         <!-- Honey + Yeast -->

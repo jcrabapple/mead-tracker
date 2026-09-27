@@ -294,12 +294,22 @@ def _check_notifications_internal(db):
 
 
 def _already_notified_today(db, rule_id, event_type):
-    """Check if a notification for this rule+event has been sent today."""
-    today_str = date.today().isoformat()
+    """Check if this rule has already fired today.
+
+    Keyed on the rule (and therefore the batch). The old version matched on
+    event_type alone, so one batch's reminder silently suppressed the same
+    reminder for every other batch that day. sent_at is stored in UTC by
+    SQLite's datetime('now'), so compare against the UTC date.
+    """
+    rule = db.execute(
+        "SELECT batch_id FROM notification_rules WHERE id = ?", (rule_id,)
+    ).fetchone()
+    batch_id = rule["batch_id"] if rule else None
+    today_str = datetime.utcnow().date().isoformat()
     count = db.execute(
         "SELECT COUNT(*) FROM notification_log "
-        "WHERE event_type = ? AND sent_at LIKE ?",
-        (event_type, f"{today_str}%"),
+        "WHERE event_type = ? AND batch_id IS ? AND status = 'sent' AND sent_at LIKE ?",
+        (event_type, batch_id, f"{today_str}%"),
     ).fetchone()[0]
     return count > 0
 

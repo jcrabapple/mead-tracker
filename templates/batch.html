@@ -14,6 +14,11 @@
             {% if batch.honey_type %}{{ batch.honey_type }} honey · {% endif %}
             {% if batch.yeast_strain %}{{ batch.yeast_strain }} · {% endif %}
             {{ batch.batch_size_gal }} gal
+            {% set st = calc.state %}
+            {% if st.volume_gal and (st.volume_gal - batch.batch_size_gal)|abs > 0.05 %}
+                · <span title="Current liquid volume after process events">{{ '%.2f'|format(st.volume_gal) }} gal now</span>
+            {% endif %}
+            {% if st.stabilized %}· <span class="badge bg-info text-dark">stabilized</span>{% endif %}
         </div>
     </div>
     <div class="d-flex gap-2">
@@ -47,14 +52,17 @@
     </div>
     <div class="col-4 col-md-2">
         <div class="card stat-card">
-            {% if batch.og and batch.fg %}
-                <div class="stat-value">~{{ calc_abv(batch.og, batch.fg) }}%</div>
-            {% elif batch.og %}
-                <div class="stat-value">~{{ calc_potential_abv(batch.og) }}%</div>
+            {% set st = calc.state %}
+            {% if batch.fg or readings|length > 1 or events %}
+                <div class="stat-value">~{{ st.abv_now if st.abv_now is not none else '—' }}%</div>
+                <div class="stat-label">{% if batch.fg %}Final ABV{% else %}Current ABV{% endif %}</div>
+            {% elif st.potential_abv is not none %}
+                <div class="stat-value">~{{ st.potential_abv }}%</div>
+                <div class="stat-label">Potential ABV</div>
             {% else %}
                 <div class="stat-value">—</div>
+                <div class="stat-label">ABV</div>
             {% endif %}
-            <div class="stat-label">{% if batch.fg %}Final ABV{% else %}Potential ABV{% endif %}</div>
         </div>
     </div>
     <div class="col-4 col-md-2">
@@ -71,11 +79,26 @@
     </div>
     <div class="col-4 col-md-2">
         <div class="card stat-card">
+            {% if calc.state.potential_abv is not none and not batch.fg %}
+            <div class="stat-value">~{{ calc.state.potential_abv }}%</div>
+            <div class="stat-label">{% if calc.state.stabilized %}Locked ABV{% else %}If Fermented Dry{% endif %}</div>
+            {% else %}
             <div class="stat-value">{{ readings|length }}</div>
             <div class="stat-label">Readings</div>
+            {% endif %}
         </div>
     </div>
 </div>
+
+{% if calc.state.segments > 1 %}
+<div class="alert alert-secondary small py-2">
+    <i class="bi bi-calculator"></i>
+    ABV accounts for {{ calc.state.segments - 1 }} volume/sugar change{{ 's' if calc.state.segments > 2 }}.
+    Carried alcohol {{ '%.1f'|format(calc.state.carry_abv) }}% from the current segment start
+    {% if calc.state.equivalent_og %}· equivalent single-ferment OG {{ '%.3f'|format(calc.state.equivalent_og) }}{% endif %}.
+    Simple (OG − G) math would say {{ calc_abv(batch.og, calc.state.current_gravity) or '—' }}%.
+</div>
+{% endif %}
 
 {% if batch.notes %}
 <div class="card mb-4">
@@ -130,7 +153,8 @@
                         <td>{{ r.reading_date }}</td>
                         <td>{{ r.day_number if r.day_number is not none else '—' }}</td>
                         <td><strong>{{ '%.3f'|format(r.gravity) }}</strong></td>
-                        <td>{{ '~' + calc_abv(batch.og, r.gravity)|string + '%' if batch.og and calc_abv(batch.og, r.gravity) else '—' }}</td>
+                        {% set rabv = calc.readings.get(r.id, {}).get('abv') %}
+                        <td>{{ '~%.1f%%'|format(rabv) if rabv else '—' }}</td>
                         <td>{{ r.temperature_f ~ '°F' if r.temperature_f else '—' }}</td>
                         <td class="text-muted">{{ r.notes }}</td>
                         <td>
@@ -175,6 +199,111 @@
                 <button type="submit" class="btn btn-honey btn-sm w-100">
                     <i class="bi bi-plus"></i> Log
                 </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Process Events -->
+<div class="card mb-4" id="process">
+    <div class="card-header">
+        <i class="bi bi-arrow-left-right"></i> Process Events
+        <small class="text-muted ms-2">dilution, backsweetening, racking, stabilizing — these change the ABV math</small>
+    </div>
+    <div class="card-body p-0">
+        {% if events %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr><th>Date</th><th>Day</th><th>Event</th><th>Change</th><th>Gravity</th><th>ABV</th><th>Volume</th><th>Notes</th><th></th></tr>
+                </thead>
+                <tbody>
+                    {% for e in events %}
+                    {% set ec = calc.events.get(e.id, {}) %}
+                    <tr>
+                        <td>{{ e.event_date }}</td>
+                        <td>{{ e.day_number if e.day_number is not none else '—' }}</td>
+                        <td><span class="badge bg-secondary">{{ event_label(e.event_type) }}</span></td>
+                        <td class="small">
+                            {% if e.volume_added_gal %}+{{ '%.2f'|format(e.volume_added_gal) }} gal ({{ '%.1f'|format(e.volume_added_gal * 4) }} qt){% endif %}
+                            {% if e.sugar_lb %}{{ ' · ' if e.volume_added_gal }}{{ '%.1f'|format(e.sugar_lb * 16) }} oz sugar{% endif %}
+                            {% if e.amount %}{{ ' · ' if e.volume_added_gal or e.sugar_lb }}{{ e.amount }}{% endif %}
+                        </td>
+                        <td class="small">
+                            {% if ec.gravity_before is not none and ec.gravity_after is not none and ec.gravity_before != ec.gravity_after %}
+                                {{ '%.3f'|format(ec.gravity_before) }} → {{ '%.3f'|format(ec.gravity_after) }}{% if ec.estimated_gravity %}<span class="text-muted" title="Estimated; log a reading to confirm">*</span>{% endif %}
+                            {% elif ec.gravity_after is not none %}{{ '%.3f'|format(ec.gravity_after) }}{% else %}—{% endif %}
+                        </td>
+                        <td class="small">
+                            {% if ec.abv_before is not none and ec.abv_after is not none and (ec.abv_before - ec.abv_after)|abs > 0.05 %}
+                                {{ '%.1f'|format(ec.abv_before) }}% → <strong>{{ '%.1f'|format(ec.abv_after) }}%</strong>
+                            {% elif ec.abv_after is not none %}{{ '%.1f'|format(ec.abv_after) }}%{% else %}—{% endif %}
+                        </td>
+                        <td class="small">
+                            {% if ec.volume_before and ec.volume_after and ec.volume_before != ec.volume_after %}
+                                {{ '%.2f'|format(ec.volume_before) }} → {{ '%.2f'|format(ec.volume_after) }}
+                            {% elif ec.volume_after %}{{ '%.2f'|format(ec.volume_after) }}{% else %}—{% endif %}
+                        </td>
+                        <td class="text-muted small">{{ e.notes }}</td>
+                        <td>
+                            <form method="post" action="/event/{{ e.id }}/delete" class="d-inline" onsubmit="return confirm('Delete this event? ABV will be recalculated.')">
+                                <button type="submit" class="btn btn-link btn-sm text-danger p-0" title="Delete"><i class="bi bi-x"></i></button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <p class="text-muted small px-3 py-2 mb-0">* estimated gravity: take a reading after the change to replace the estimate.</p>
+        {% else %}
+        <p class="text-muted text-center py-3 mb-0">No process events yet.</p>
+        {% endif %}
+    </div>
+    <div class="card-footer">
+        <form method="post" action="/batch/{{ batch.id }}/event" class="row g-2 align-items-end">
+            <div class="col-6 col-md-2">
+                <label class="form-label">Date</label>
+                <input type="date" name="event_date" class="form-control form-control-sm" value="{{ today }}">
+            </div>
+            <div class="col-6 col-md-2">
+                <label class="form-label">Event</label>
+                <select name="event_type" class="form-select form-select-sm" id="evType">
+                    {% for k, v in EVENT_TYPES.items() %}<option value="{{ k }}">{{ v[0] }}</option>{% endfor %}
+                </select>
+            </div>
+            <div class="col-6 col-md-2 ev-vol">
+                <label class="form-label">Liquid Added</label>
+                <div class="input-group input-group-sm">
+                    <input type="number" name="volume_added" step="0.01" min="0" class="form-control" placeholder="1.6">
+                    <select name="volume_unit" class="form-select" style="max-width:5.5rem;">
+                        <option value="qt">qt</option><option value="gal">gal</option><option value="cups">cups</option>
+                    </select>
+                </div>
+            </div>
+            <div class="col-6 col-md-1 ev-sugar">
+                <label class="form-label">Sugar oz</label>
+                <input type="number" name="sugar_oz" step="0.1" min="0" class="form-control form-control-sm" placeholder="6">
+            </div>
+            <div class="col-4 col-md-1">
+                <label class="form-label">SG Before</label>
+                <input type="number" name="gravity_before" step="0.001" min="0.900" max="1.250" class="form-control form-control-sm" placeholder="auto">
+            </div>
+            <div class="col-4 col-md-1">
+                <label class="form-label">SG After</label>
+                <input type="number" name="gravity_after" step="0.001" min="0.900" max="1.250" class="form-control form-control-sm" placeholder="est.">
+            </div>
+            <div class="col-4 col-md-1">
+                <label class="form-label">Vol After</label>
+                <input type="number" name="volume_after_gal" step="0.01" min="0" class="form-control form-control-sm" placeholder="gal">
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">Amount / Notes</label>
+                <input type="text" name="notes" class="form-control form-control-sm" placeholder="1/4 tsp k-meta…">
+            </div>
+            <div class="col-12 col-md-12 d-flex justify-content-between align-items-center">
+                <small class="text-muted">Dilute: liquid added. Backsweeten: sugar oz (+ SG after if measured). Rack: volume after. Leave SG before blank to use the last reading.</small>
+                <button type="submit" class="btn btn-honey btn-sm"><i class="bi bi-plus"></i> Log Event</button>
             </div>
         </form>
     </div>
@@ -492,9 +621,22 @@
 {% block extra_scripts %}
 {% if readings|length > 1 %}
 <script>
-const labels = {{ chart_labels | tojson }};
-const gravities = {{ chart_gravities | tojson }};
-const abvs = {{ chart_abvs | tojson }};
+const readingDates = {{ chart_labels | tojson }};
+const rawGravities = {{ chart_gravities | tojson }};
+const rawAbvs = {{ chart_abvs | tojson }};
+const procEvents = {{ chart_events | tojson }};
+// Merge event dates into the x axis so events show up between readings
+const labels = [...new Set([...readingDates, ...procEvents.map(e => e.date)])].sort();
+const pick = (vals) => labels.map(d => { const i = readingDates.lastIndexOf(d); return i >= 0 ? vals[i] : null; });
+const gravities = pick(rawGravities);
+const abvs = pick(rawAbvs);
+const eventLabelsByDate = {};
+procEvents.forEach(e => { (eventLabelsByDate[e.date] ||= []).push(e.label); });
+const eventMarkers = (series) => labels.map((d, i) => {
+    if (!eventLabelsByDate[d]) return null;
+    for (let j = i; j >= 0; j--) if (series[j] != null) return series[j];
+    return series.find(v => v != null) ?? null;
+});
 
 const ctx = document.getElementById('fermChart').getContext('2d');
 let chart = new Chart(ctx, {
@@ -510,6 +652,15 @@ let chart = new Chart(ctx, {
             tension: 0.3,
             pointRadius: 4,
             pointBackgroundColor: '#d4a017',
+            spanGaps: true,
+        }, {
+            label: 'Process event',
+            data: eventMarkers(gravities),
+            showLine: false,
+            pointStyle: 'triangle',
+            pointRadius: 8,
+            pointBackgroundColor: '#8957e5',
+            borderColor: '#8957e5',
         }]
     },
     options: {
@@ -517,6 +668,13 @@ let chart = new Chart(ctx, {
         maintainAspectRatio: false,
         plugins: {
             legend: { display: false },
+            tooltip: {
+                callbacks: {
+                    label: (ctx) => ctx.datasetIndex === 1
+                        ? (eventLabelsByDate[labels[ctx.dataIndex]] || []).join(', ')
+                        : `${ctx.dataset.label}: ${ctx.formattedValue}`,
+                },
+            },
         },
         scales: {
             x: {
@@ -534,6 +692,7 @@ let chart = new Chart(ctx, {
 
 document.getElementById('chartGravity').addEventListener('change', function() {
     chart.data.datasets[0].data = gravities;
+    chart.data.datasets[1].data = eventMarkers(gravities);
     chart.data.datasets[0].label = 'Gravity';
     chart.data.datasets[0].borderColor = '#d4a017';
     chart.data.datasets[0].pointBackgroundColor = '#d4a017';
@@ -544,6 +703,7 @@ document.getElementById('chartGravity').addEventListener('change', function() {
 
 document.getElementById('chartAbv').addEventListener('change', function() {
     chart.data.datasets[0].data = abvs;
+    chart.data.datasets[1].data = eventMarkers(abvs);
     chart.data.datasets[0].label = 'ABV %';
     chart.data.datasets[0].borderColor = '#238636';
     chart.data.datasets[0].pointBackgroundColor = '#238636';

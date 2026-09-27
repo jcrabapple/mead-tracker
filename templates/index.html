@@ -52,7 +52,8 @@
                     <div class="text-muted small mb-2">
                         {% if b.style %}{{ b.style }} · {% endif %}
                         {% if b.yeast_strain %}{{ b.yeast_strain }} · {% endif %}
-                        {{ b.batch_size_gal }}gal
+                        {% if b.volume_now and (b.volume_now - b.batch_size_gal)|abs > 0.05 %}{{ '%.2f'|format(b.volume_now) }}gal now{% else %}{{ b.batch_size_gal }}gal{% endif %}
+                        {% if b.diluted %}· <span title="ABV accounts for dilution">diluted</span>{% endif %}
                     </div>
                     <div class="d-flex gap-3 small">
                         {% if b.og %}
@@ -61,10 +62,10 @@
                             <strong style="color:var(--honey);">{{ '%.3f'|format(b.og) }}</strong>
                         </div>
                         {% endif %}
-                        {% if b.latest_gravity %}
+                        {% if b.current_gravity is not none %}
                         <div>
                             <span class="text-muted">Current</span>
-                            <strong>{{ '%.3f'|format(b.latest_gravity.gravity) }}</strong>
+                            <strong>{{ '%.3f'|format(b.current_gravity) }}</strong>
                         </div>
                         {% endif %}
                         {% if b.current_abv is not none %}
