@@ -170,4 +170,4 @@ Traditional, Melomel, Metheglin, Cyser, Pyment, Braggot, Session Mead, Sack Mead
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
