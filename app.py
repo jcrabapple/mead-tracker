@@ -29,9 +29,15 @@ import requests as http_requests
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("MEAD_SECRET_KEY") or os.urandom(24)
+
+# Keep in step with the git tag when cutting a release; surfaced in Settings
+# and in /healthz so a running instance reports which release it is.
+APP_VERSION = "1.1.0"
+
+
 @app.context_processor
 def _inject_today():
-    return {"today": date.today().isoformat()}
+    return {"today": date.today().isoformat(), "app_version": APP_VERSION}
 
 
 app.jinja_env.globals.update(event_label=event_label, EVENT_TYPES=EVENT_TYPES,
@@ -138,7 +144,7 @@ def manifest():
 
 @app.route("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "version": APP_VERSION}
 
 
 # ── Database helpers ──────────────────────────────────────────────

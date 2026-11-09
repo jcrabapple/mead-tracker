@@ -231,3 +231,26 @@ def test_icons_public(client, path):
 
 def test_other_static_still_private(client):
     assert client.get("/static/nope.css").status_code == 401
+
+
+# ── Version surfacing ─────────────────────────────────────────────
+
+def test_version_is_semver_and_matches_tag_convention():
+    import re
+    version = sys.modules["app"].APP_VERSION
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version), version
+
+
+def test_healthz_reports_version(client):
+    version = sys.modules["app"].APP_VERSION
+    body = client.get("/healthz").get_json()
+    assert body == {"ok": True, "version": version}
+
+
+def test_settings_footer_shows_version(client):
+    version = sys.modules["app"].APP_VERSION
+    r = client.get("/settings", headers=basic())
+    assert r.status_code == 200
+    html = r.get_data(as_text=True)
+    assert f"Mead Tracker v{version}" in html
+    assert f"releases/tag/v{version}" in html
