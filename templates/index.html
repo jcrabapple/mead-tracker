@@ -28,7 +28,7 @@
     <div class="col-6 col-md-3">
         <div class="card stat-card">
             <div class="stat-value">{{ batches|selectattr('status','equalto','bottled')|list|length + batches|selectattr('status','equalto','drinking')|list|length }}</div>
-            <div class="stat-label">Bottled/Drinking</div>
+            <div class="stat-label">Bottled/<wbr>Drinking</div>
         </div>
     </div>
     <div class="col-6 col-md-3">

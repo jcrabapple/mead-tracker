@@ -19,8 +19,65 @@
             --honey-dark: #8b6914;
         }
         body { background: #0d1117; color: #c9d1d9; }
-        .navbar { background: #161b22 !important; border-bottom: 1px solid #30363d; }
-        .navbar-brand { color: var(--honey) !important; font-weight: 700; }
+
+        /* ---- App header ---- */
+        .app-header {
+            position: sticky;
+            top: 0;
+            z-index: 1030;
+            background: rgba(22, 27, 34, 0.92);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid #30363d;
+        }
+        .app-header-inner { display: flex; align-items: center; gap: 0.75rem; }
+        .app-brand {
+            display: flex; align-items: center; gap: 0.45rem;
+            color: var(--honey) !important; font-weight: 700;
+            font-size: 1.15rem; letter-spacing: -0.01em;
+            text-decoration: none; padding: 0.55rem 0;
+        }
+        .app-brand img { border-radius: 6px; display: block; }
+        .app-nav { display: flex; align-items: center; gap: 0.25rem; margin-left: auto; }
+        .app-nav-link {
+            display: flex; align-items: center; gap: 0.4rem;
+            padding: 0.45rem 0.7rem; border-radius: 8px;
+            color: #8b949e; font-size: 0.9rem; font-weight: 500;
+            text-decoration: none; white-space: nowrap;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        .app-nav-link:hover { color: #e6edf3; background: #21262d; }
+        .app-nav-link.active { color: var(--honey); background: rgba(212, 160, 23, 0.12); }
+        .app-nav-link i { font-size: 1.05rem; line-height: 1; }
+
+        .app-nav-link span {
+            min-width: 0; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+        }
+        .lbl-short { display: none; }
+
+        @media (max-width: 575.98px) {
+            .app-header-inner {
+                flex-direction: column; align-items: stretch; gap: 0;
+                padding-top: env(safe-area-inset-top, 0px);
+            }
+            .app-brand { font-size: 1.05rem; padding: 0.6rem 0 0.45rem; }
+            .app-brand img { width: 24px; height: 24px; }
+            .app-nav {
+                margin-left: 0; gap: 0.15rem;
+                border-top: 1px solid #21262d;
+                padding: 0.3rem 0;
+            }
+            .app-nav-link {
+                flex: 1 1 0; flex-direction: column;
+                gap: 0.2rem; padding: 0.4rem 0.15rem;
+                font-size: 0.65rem; font-weight: 600;
+                letter-spacing: 0.01em; text-align: center;
+            }
+            .app-nav-link i { font-size: 1.2rem; }
+            .app-nav-link.active { background: rgba(212, 160, 23, 0.14); }
+            .lbl-long { display: none; }
+            .lbl-short { display: inline; }
+        }
         .card { background: #161b22; border: 1px solid #30363d; }
         .card-header { background: #1c2129; border-bottom: 1px solid #30363d; }
         .badge-planning { background: #6e7681; }
@@ -58,20 +115,31 @@
     {% block extra_head %}{% endblock %}
 </head>
 <body>
-    <nav class="navbar navbar-expand-sm">
-        <div class="container">
-            <a class="navbar-brand" href="/">
-                <img src="/static/favicon.svg?v=1" alt="" width="26" height="26" class="me-1" style="vertical-align:-6px;border-radius:6px;"> Mead Tracker
+    {% set p = request.path %}
+    <header class="app-header">
+        <div class="container app-header-inner">
+            <a class="app-brand" href="/">
+                <img src="/static/favicon.svg?v=1" alt="" width="26" height="26"> Mead Tracker
             </a>
-            <div class="navbar-nav ms-auto">
-                <a class="nav-link" href="/inventory"><i class="bi bi-cup"></i> Cellar</a>
-                <a class="nav-link" href="/tools"><i class="bi bi-calculator"></i> Calculators</a>
-                <a class="nav-link" href="/recipe/generate"><i class="bi bi-stars"></i> AI Recipe</a>
-                <a class="nav-link" href="/batch/new"><i class="bi bi-plus-circle"></i> New Batch</a>
-                <a class="nav-link" href="/settings"><i class="bi bi-gear"></i> Settings</a>
-            </div>
+            <nav class="app-nav" aria-label="Main">
+                <a class="app-nav-link{% if p.startswith('/inventory') %} active{% endif %}" href="/inventory"{% if p.startswith('/inventory') %} aria-current="page"{% endif %}>
+                    <i class="bi bi-cup" aria-hidden="true"></i><span>Cellar</span>
+                </a>
+                <a class="app-nav-link{% if p.startswith('/tools') %} active{% endif %}" href="/tools"{% if p.startswith('/tools') %} aria-current="page"{% endif %}>
+                    <i class="bi bi-calculator" aria-hidden="true"></i><span><span class="lbl-long">Calculators</span><span class="lbl-short">Calc</span></span>
+                </a>
+                <a class="app-nav-link{% if p.startswith('/recipe') %} active{% endif %}" href="/recipe/generate"{% if p.startswith('/recipe') %} aria-current="page"{% endif %}>
+                    <i class="bi bi-stars" aria-hidden="true"></i><span>AI Recipe</span>
+                </a>
+                <a class="app-nav-link{% if p == '/batch/new' %} active{% endif %}" href="/batch/new"{% if p == '/batch/new' %} aria-current="page"{% endif %}>
+                    <i class="bi bi-plus-circle" aria-hidden="true"></i><span><span class="lbl-long">New Batch</span><span class="lbl-short">New</span></span>
+                </a>
+                <a class="app-nav-link{% if p.startswith('/settings') %} active{% endif %}" href="/settings"{% if p.startswith('/settings') %} aria-current="page"{% endif %}>
+                    <i class="bi bi-gear" aria-hidden="true"></i><span>Settings</span>
+                </a>
+            </nav>
         </div>
-    </nav>
+    </header>
 
     <main class="container py-4">
         {% with messages = get_flashed_messages(with_categories=true) %}
