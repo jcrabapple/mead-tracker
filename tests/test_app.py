@@ -1,85 +1,127 @@
-import base64
 import importlib
-import os
 import sys
 
 import pytest
-from werkzeug.security import generate_password_hash
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-
-TOKEN = "test-token-123"
-
-
-@pytest.fixture
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEAD_DB_PATH", str(tmp_path / "t.db"))
-    monkeypatch.setenv("MEAD_USER", "jason")
-    monkeypatch.setenv("MEAD_PASSWORD_HASH", generate_password_hash("hunter2"))
-    monkeypatch.setenv("MEAD_API_TOKEN", TOKEN)
-    monkeypatch.delenv("MEAD_AUTH_DISABLED", raising=False)
-    sys.modules.pop("app", None)
-    app_mod = importlib.import_module("app")
-    app_mod.app.config["TESTING"] = True
-    assert app_mod.scheduler is None, "scheduler must not start on import"
-    return app_mod.app.test_client()
-
-
-def basic(user="jason", pw="hunter2"):
-    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
-
-
-API = {"Authorization": f"Bearer {TOKEN}"}
+from conftest import API, TOKEN, basic, login  # noqa: F401  (fixtures + helpers)
 
 
 # ── Auth ──────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("path", ["/", "/settings", "/backup/download", "/export/json", "/batch/new"])
-def test_ui_requires_basic_auth(client, path):
-    r = client.get(path)
-    assert r.status_code == 401
-    assert "Basic" in r.headers["WWW-Authenticate"]
+def test_ui_redirects_to_login(anon, path):
+    r = anon.get(path)
+    assert r.status_code == 302
+    assert "/login" in r.headers["Location"]
 
 
-def test_wrong_password_rejected(client):
-    assert client.get("/", headers=basic(pw="nope")).status_code == 401
+def test_redirect_keeps_the_original_path(anon):
+    r = anon.get("/inventory")
+    assert r.headers["Location"].endswith("/login?next=/inventory")
 
 
-def test_basic_auth_works(client):
-    assert client.get("/", headers=basic()).status_code == 200
+def test_login_page_is_public(anon):
+    r = anon.get("/login")
+    assert r.status_code == 200
+    assert b'name="password"' in r.data
+    assert b'autocomplete="current-password"' in r.data
 
 
-def test_backup_download_requires_auth(client):
-    r = client.get("/backup/download")
-    assert r.status_code == 401
+def test_login_sets_session_and_grants_access(anon):
+    r = login(anon)
+    assert r.status_code == 302
+    cookie = r.headers.get("Set-Cookie", "")
+    assert "mead_session=" in cookie
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+    assert anon.get("/settings").status_code == 200
+
+
+def test_login_wrong_password_does_not_set_session(anon):
+    r = login(anon, "nope")
+    assert r.status_code == 200
+    assert b"Incorrect username or password" in r.data
+    assert "mead_session" not in r.headers.get("Set-Cookie", "")
+    assert anon.get("/settings").status_code == 302
+
+
+def test_login_unknown_user_gets_the_same_error(anon):
+    r = login(anon, "hunter2", user="nobody")
+    assert r.status_code == 200
+    assert b"Incorrect username or password" in r.data
+
+
+def test_login_honours_safe_next(anon):
+    r = anon.post("/login?next=/inventory", data={"username": "jason", "password": "hunter2"})
+    assert r.headers["Location"] == "/inventory"
+
+
+@pytest.mark.parametrize("bad", ["//evil.example/x", "https://evil.example/x", "\\evil", ""])
+def test_login_blocks_open_redirect(anon, bad):
+    r = anon.post(f"/login?next={bad}", data={"username": "jason", "password": "hunter2"})
+    assert r.headers["Location"] == "/"
+
+
+def test_logout_clears_session(anon):
+    login(anon)
+    assert anon.get("/").status_code == 200
+    assert anon.post("/logout").status_code == 302
+    assert anon.get("/").status_code == 302
+
+
+def test_logout_is_post_only(client):
+    assert client.get("/logout").status_code == 405
+
+
+def test_login_throttled_after_repeated_failures(anon):
+    for _ in range(10):
+        login(anon, "bad")
+    assert login(anon).status_code == 429
+    assert anon.get("/").status_code == 302
+
+
+def test_login_post_rejects_cross_origin(anon):
+    r = anon.post("/login", data={"username": "jason", "password": "hunter2"},
+                  headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+
+
+def test_basic_auth_does_not_grant_the_ui(anon):
+    assert anon.get("/", headers=basic()).status_code == 302
+
+
+def test_basic_auth_still_works_for_the_api(anon):
+    assert anon.get("/api/batches", headers=basic()).status_code == 200
+
+
+def test_backup_download_requires_auth(anon):
+    r = anon.get("/backup/download")
+    assert r.status_code == 302
     assert b"SQLite" not in r.data
 
 
-def test_restore_requires_auth(client):
-    assert client.post("/backup/restore").status_code == 401
+def test_restore_requires_auth(anon):
+    assert anon.post("/backup/restore").status_code == 401
 
 
-def test_healthz_public(client):
-    assert client.get("/healthz").status_code == 200
+def test_healthz_public(anon):
+    assert anon.get("/healthz").status_code == 200
 
 
-def test_api_requires_token(client):
-    assert client.get("/api/batches").status_code == 401
-    assert client.get("/api/batches", headers={"Authorization": "Bearer wrong"}).status_code == 401
-    assert client.get("/api/batches", headers=API).status_code == 200
+def test_api_requires_token(anon):
+    assert anon.get("/api/batches").status_code == 401
+    assert anon.get("/api/batches", headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert anon.get("/api/batches", headers=API).status_code == 200
 
 
-def test_bearer_does_not_unlock_ui(client):
-    assert client.get("/settings", headers=API).status_code == 401
+def test_bearer_does_not_unlock_ui(anon):
+    assert anon.get("/settings", headers=API).status_code == 302
 
 
 def test_cross_origin_form_post_blocked(client):
-    h = {**basic(), "Origin": "https://evil.example"}
-    r = client.post("/batch/new", data={"name": "x"}, headers=h)
+    r = client.post("/batch/new", data={"name": "x"}, headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
-    h = {**basic(), "Origin": "http://localhost"}
-    r = client.post("/batch/new", data={"name": "ok"}, headers=h)
+    r = client.post("/batch/new", data={"name": "ok"}, headers={"Origin": "http://localhost"})
     assert r.status_code == 302
 
 
@@ -89,12 +131,16 @@ def test_refuses_when_no_credentials_configured(tmp_path, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     sys.modules.pop("app", None)
     c = importlib.import_module("app").app.test_client()
-    assert c.get("/").status_code == 401
+    # No credentials configured: the UI sends you to /login, which answers 503.
+    assert c.get("/").status_code == 302
+    assert c.get("/login").status_code == 503
     assert c.get("/api/batches").status_code == 401
     assert c.get("/api/batches", headers={"Authorization": "Bearer "}).status_code == 401
 
 
 # ── Write API ─────────────────────────────────────────────────────
+
+
 
 def make_batch(client, **kw):
     body = {"name": "Pumpkin", "og": 1.110, "batch_size_gal": 1.0, "initial_volume_gal": 0.625,
@@ -190,19 +236,19 @@ def test_ui_event_form_and_pages_render(client):
     bid = b["id"]
     client.post(f"/api/batch/{bid}/readings", json={"gravity": 1.110, "date": "2026-09-27"}, headers=API)
     client.post(f"/api/batch/{bid}/readings", json={"gravity": 1.000, "date": "2026-10-10"}, headers=API)
-    r = client.post(f"/batch/{bid}/event", headers=basic(), data={
+    r = client.post(f"/batch/{bid}/event", data={
         "event_type": "dilute", "event_date": "2026-10-11", "volume_added": "1.6", "volume_unit": "qt",
         "sugar_oz": "", "gravity_before": "", "gravity_after": "", "volume_after_gal": "", "notes": "",
     })
     assert r.status_code == 302
-    page = client.get(f"/batch/{bid}", headers=basic())
+    page = client.get(f"/batch/{bid}")
     assert page.status_code == 200
     html = page.data.decode()
     assert "Process Events" in html and "Dilute (add water)" in html
     assert "8.8%" in html                      # event-aware ABV shown
-    assert client.get("/", headers=basic()).status_code == 200
-    assert client.get("/export/csv", headers=basic()).status_code == 200
-    assert client.get(f"/batch/{bid}/edit", headers=basic()).status_code == 200
+    assert client.get("/").status_code == 200
+    assert client.get("/export/csv").status_code == 200
+    assert client.get(f"/batch/{bid}/edit").status_code == 200
 
 
 def test_notification_dedupe_is_per_batch(tmp_path):
@@ -229,8 +275,8 @@ def test_icons_public(client, path):
     assert r.status_code == 200 and len(r.data) > 100
 
 
-def test_other_static_still_private(client):
-    assert client.get("/static/nope.css").status_code == 401
+def test_other_static_still_private(anon):
+    assert anon.get("/static/nope.css").status_code == 302
 
 
 # ── Version surfacing ─────────────────────────────────────────────
@@ -249,7 +295,7 @@ def test_healthz_reports_version(client):
 
 def test_settings_footer_shows_version(client):
     version = sys.modules["app"].APP_VERSION
-    r = client.get("/settings", headers=basic())
+    r = client.get("/settings")
     assert r.status_code == 200
     html = r.get_data(as_text=True)
     assert f"Mead Tracker v{version}" in html

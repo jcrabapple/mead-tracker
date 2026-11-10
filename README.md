@@ -19,7 +19,7 @@ Built with Flask and SQLite. Dark-themed, mobile-friendly, zero dependencies bey
 - **Backup & restore** — Download your entire SQLite database as a `.db` file; restore from a previous backup with schema validation
 - **Export** — JSON export (full data per batch or all batches) and CSV export (spreadsheet-friendly summary)
 - **Process events** — log dilution, backsweetening, step-feeds, racking, stabilizing, spicing, and more. ABV and volume are recomputed across every volume/sugar change, so a diluted or backsweetened batch reports its real strength instead of `(OG − G) × 131.25`
-- **Authentication** — HTTP Basic auth for the UI, bearer token for the API, same-origin check on form POSTs
+- **Authentication** — login form backed by a signed session cookie (30 days, rolled forward on each visit), so the browser keeps you signed in; bearer token (or Basic) for the API; same-origin check on form POSTs
 - **Read/write REST API** — create batches, log readings, nutrients, tastings, ingredients, and process events; every write returns the batch's recomputed state
 - **Next Up panel** — dated tasks (nutrient doses, "strain fruit by day 14") plus automatic rules derived from batch data: reading gaps, 1/3 sugar break, stable gravity, fruit contact time, backsweetened-but-not-stabilized, ready to backsweeten, bottling bookkeeping. Due tasks go out once through the configured notification channels
 - **Calculators** — TOSNA 2.0 nutrients (with one-click dose tasks), dilution to a target ABV, backsweetening (honey, maple, sugar, dextrose; accounts for the sweetener's own volume), honey for a target OG. Any calculator can prefill from a batch
@@ -55,7 +55,7 @@ set -a; . ~/.config/mead-tracker/env; set +a
 python app.py
 ```
 
-Open **http://localhost:8789** in your browser. With no credentials configured every request returns 401; set `MEAD_AUTH_DISABLED=1` only for local development. `MEAD_DEV=1` runs Flask's debug server instead of waitress.
+Open **http://localhost:8789** in your browser and sign in with the credentials from the step above. The session lasts 30 days and slides forward each visit; set `MEAD_SESSION_DAYS` to change that. With no credentials configured every page redirects to a login form that reports the missing setup; set `MEAD_AUTH_DISABLED=1` only for local development. `MEAD_DEV=1` runs Flask's debug server instead of waitress.
 
 ### systemd
 
@@ -134,6 +134,12 @@ All `/api/*` routes need `Authorization: Bearer $MEAD_API_TOKEN`. Bodies are JSO
 | `/api/event-types` | GET | Event types and whether each affects the math |
 | `/api/notifications/log` | GET | Recent notification sends |
 | `/healthz` | GET | Unauthenticated liveness check |
+
+### Authentication
+
+The browser UI uses a login form at `/login`. A successful login sets a signed `mead_session` cookie (`HttpOnly`, `SameSite=Lax`, and `Secure` whenever the request arrived over HTTPS, including through a reverse proxy that sets `X-Forwarded-Proto`). Sessions last 30 days and are refreshed on each request, so a device stays signed in until you press **Log out** on the Settings page.
+
+The API is separate: send `Authorization: Bearer $MEAD_API_TOKEN`. Basic auth is also accepted on `/api/*`, but not on UI pages, so a browser cannot bypass the login form. Running under waitress, the entry point trusts `X-Forwarded-For` and `X-Forwarded-Proto` from `127.0.0.1` only, which is what the Cloudflare tunnel connects from.
 
 `scripts/mead.py` is a small CLI over the API (`mead.py reading 3 1.050 --notes "day 5"`, `mead.py event 3 dilute --qt 1.6`). If the app sits behind Cloudflare, send a non-default User-Agent; the default `Python-urllib` UA is blocked by its bot check.
 

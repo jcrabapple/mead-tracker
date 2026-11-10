@@ -10,14 +10,17 @@ import json
 import shutil
 import sqlite3
 import logging
+import threading
 from datetime import datetime, date, timedelta
 from contextlib import contextmanager
 
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    jsonify, flash, g, send_file, send_from_directory, Response
+    jsonify, flash, g, send_file, send_from_directory, Response, session
 )
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -28,11 +31,10 @@ from meadcalc import EVENT_TYPES, SWEETENERS, event_label
 import requests as http_requests
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("MEAD_SECRET_KEY") or os.urandom(24)
 
 # Keep in step with the git tag when cutting a release; surfaced in Settings
 # and in /healthz so a running instance reports which release it is.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 @app.context_processor
@@ -48,14 +50,47 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "mead.db"),
 )
 
+
+def _load_secret_key():
+    """Signing key for the session cookie.
+
+    MEAD_SECRET_KEY wins when set. Otherwise generate one once and keep it in
+    the database, so a restart does not silently log the browser out. Storing
+    it beside the data it protects is fine: whoever can read mead.db already
+    has every batch and tasting note.
+    """
+    env_key = os.environ.get("MEAD_SECRET_KEY")
+    if env_key:
+        return env_key
+    db = sqlite3.connect(DB_PATH)
+    try:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS app_config ("
+            "  key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        row = db.execute("SELECT value FROM app_config WHERE key='secret_key'").fetchone()
+        if row:
+            return row[0]
+        key = secrets.token_hex(32)
+        db.execute("INSERT INTO app_config (key, value) VALUES ('secret_key', ?)", (key,))
+        db.commit()
+        return key
+    finally:
+        db.close()
+
+
+app.secret_key = _load_secret_key()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 # ── Authentication ────────────────────────────────────────────────
 #
-# Browser UI: HTTP Basic auth. MEAD_USER + MEAD_PASSWORD_HASH (werkzeug hash).
-# /api/*:     Authorization: Bearer $MEAD_API_TOKEN (Basic also accepted).
+# Browser UI: a login form sets a signed session cookie with a sliding 30-day
+# lifetime, so the browser can keep you signed in. HTTP Basic is still accepted
+# for curl and anything already using `-u`.
+# /api/*:     Authorization: Bearer *** (Basic also accepted).
 # If no credentials are configured the app refuses every request rather than
 # silently running open. Set MEAD_AUTH_DISABLED=1 for local dev/tests only.
 
@@ -63,11 +98,39 @@ AUTH_USER = os.environ.get("MEAD_USER", "")
 AUTH_PASS_HASH = os.environ.get("MEAD_PASSWORD_HASH", "")
 API_TOKEN = os.environ.get("MEAD_API_TOKEN", "")
 AUTH_DISABLED = os.environ.get("MEAD_AUTH_DISABLED") == "1"
+SESSION_DAYS = int(os.environ.get("MEAD_SESSION_DAYS", "30"))
+LOGIN_MAX_FAILURES = 10
+LOGIN_WINDOW = timedelta(minutes=15)
 PUBLIC_PATHS = {
-    "/healthz", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png",
+    "/healthz", "/login", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png",
     "/manifest.webmanifest", "/static/favicon.svg", "/static/favicon.ico",
     "/static/apple-touch-icon.png", "/static/icon-192.png", "/static/icon-512.png",
 }
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_NAME="mead_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS),
+    SESSION_REFRESH_EACH_REQUEST=True,
+)
+
+
+class _SchemeAwareSession(SecureCookieSessionInterface):
+    """Mark the cookie Secure when the request arrived over HTTPS.
+
+    Flask reads the flag from config, but this app serves both https through
+    the tunnel and plain http on localhost, so the decision belongs to the
+    request. ProxyFix below makes request.is_secure believe X-Forwarded-Proto.
+    """
+
+    def get_cookie_secure(self, app):
+        return bool(request.is_secure)
+
+
+app.session_interface = _SchemeAwareSession()
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+app.jinja_env.globals.update(session_days=SESSION_DAYS)
 
 
 def _basic_ok(auth):
@@ -85,10 +148,17 @@ def _bearer_ok():
     return hmac.compare_digest(header[7:].strip(), API_TOKEN)
 
 
+def _session_ok():
+    user = session.get("user")
+    if not user or not AUTH_USER:
+        return False
+    return hmac.compare_digest(user, AUTH_USER)
+
+
 def _same_origin_ok():
-    """Basic-auth credentials are sent automatically by the browser, so a
-    cross-site form POST would be authenticated. Reject state-changing
-    browser requests whose Origin/Referer is a different host."""
+    """Session cookies are sent automatically by the browser, so a cross-site
+    form POST would be authenticated. Reject state-changing requests whose
+    Origin/Referer is a different host."""
     src = request.headers.get("Origin") or request.headers.get("Referer")
     if not src:
         return True  # curl, API clients, some privacy-stripped browsers
@@ -96,23 +166,100 @@ def _same_origin_ok():
     return urlparse(src).netloc == request.host
 
 
+def _safe_next(value):
+    """Only allow a same-site relative path after login."""
+    if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
+        return "/"
+    return value
+
+
+def _client_ip():
+    return request.remote_addr or "unknown"
+
+
+# Failed-login throttle. In-memory is enough here: a single waitress process
+# serves the whole site, and a restart clearing the counters costs nothing.
+_login_failures = {}
+_login_lock = threading.Lock()
+
+
+def _login_blocked():
+    now = datetime.now()
+    with _login_lock:
+        recent = [t for t in _login_failures.get(_client_ip(), []) if now - t < LOGIN_WINDOW]
+        _login_failures[_client_ip()] = recent
+        return len(recent) >= LOGIN_MAX_FAILURES
+
+
+def _record_login_failure():
+    with _login_lock:
+        _login_failures.setdefault(_client_ip(), []).append(datetime.now())
+
+
+def _clear_login_failures():
+    with _login_lock:
+        _login_failures.pop(_client_ip(), None)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    nxt = _safe_next(request.values.get("next", ""))
+    if AUTH_DISABLED or _session_ok():
+        return redirect(nxt)
+    if not (AUTH_USER and AUTH_PASS_HASH):
+        return render_template(
+            "login.html", error="No credentials are configured on this server.",
+            next=nxt, username="",
+        ), 503
+
+    error = None
+    username = request.form.get("username", "") if request.method == "POST" else ""
+    if request.method == "POST":
+        if not _same_origin_ok():
+            return Response("Cross-origin request blocked.", 403)
+        if _login_blocked():
+            return render_template(
+                "login.html", error="Too many failed attempts. Try again in a few minutes.",
+                next=nxt, username=username,
+            ), 429
+        user_ok = hmac.compare_digest(username, AUTH_USER)
+        pass_ok = check_password_hash(AUTH_PASS_HASH, request.form.get("password", ""))
+        if user_ok and pass_ok:
+            _clear_login_failures()
+            session.clear()
+            session["user"] = AUTH_USER
+            session.permanent = True
+            logger.info("login ok for %s from %s", AUTH_USER, _client_ip())
+            return redirect(nxt)
+        _record_login_failure()
+        logger.warning("failed login from %s", _client_ip())
+        error = "Incorrect username or password."
+
+    return render_template("login.html", error=error, next=nxt, username=username)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.before_request
 def require_auth():
     if AUTH_DISABLED or request.path in PUBLIC_PATHS:
         return None
     is_api = request.path.startswith("/api/")
-    if is_api and _bearer_ok():
-        return None
-    if _basic_ok(request.authorization):
-        if request.method not in ("GET", "HEAD", "OPTIONS") and not is_api and not _same_origin_ok():
+    if is_api:
+        if _bearer_ok() or _basic_ok(request.authorization):
+            return None
+        return jsonify({"error": "unauthorized"}), 401
+    if _session_ok():
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not _same_origin_ok():
             return Response("Cross-origin request blocked.", 403)
         return None
-    if is_api:
-        return jsonify({"error": "unauthorized"}), 401
-    return Response(
-        "Authentication required.", 401,
-        {"WWW-Authenticate": 'Basic realm="Mead Tracker", charset="UTF-8"'},
-    )
+    if request.method in ("GET", "HEAD"):
+        return redirect(url_for("login", next=request.full_path.rstrip("?")))
+    return Response("Authentication required.", 401)
 
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -2298,4 +2445,10 @@ if __name__ == "__main__":
         app.run(host=host, port=port, debug=True, use_reloader=False)
     else:
         from waitress import serve
-        serve(app, host=host, port=port, threads=8)
+        # trusted_proxy keeps X-Forwarded-Proto from the local Cloudflare
+        # tunnel (waitress 3.x otherwise strips X-Forwarded-* from any peer
+        # that is not listed, so request.is_secure would always be False and
+        # the session cookie would never be marked Secure).
+        serve(app, host=host, port=port, threads=8,
+              trusted_proxy="127.0.0.1",
+              trusted_proxy_headers={"x-forwarded-for", "x-forwarded-proto"})

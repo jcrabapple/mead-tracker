@@ -5,7 +5,7 @@ import pytest
 
 import meadcalc as mc
 import planner
-from test_app import API, basic, client  # noqa: F401  (fixture re-export)
+from conftest import API, basic  # noqa: F401  (fixtures come from conftest)
 
 
 # ── Calculator math ──────────────────────────────────────────────
